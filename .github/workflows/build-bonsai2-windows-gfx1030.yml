@@ -39,10 +39,83 @@ jobs:
           $url = "https://download.amd.com/developer/eula/rocm-hub/AMD-Software-PRO-Edition-26.Q3-Win11-For-HIP.exe"
           Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\HIP-SDK.exe" -UseBasicParsing
 
-      - name: 安装 HIP SDK
+            - name: 安装 HIP SDK
         shell: powershell
+        timeout-minutes: 45          # 兜底硬超时，防止脚本自身挂掉
         run: |
-          Start-Process -FilePath "$env:TEMP\HIP-SDK.exe" -ArgumentList "/S" -Wait -NoNewWindow
+          $installer = "$env:TEMP\HIP-SDK.exe"
+          $timeoutMinutes = 30       # 主动超时阈值
+          $deadline = (Get-Date).AddMinutes($timeoutMinutes)
+
+          Write-Host "启动 HIP SDK 安装，超时阈值: $timeoutMinutes 分钟"
+
+          # 启动安装进程，不等待
+          $proc = Start-Process -FilePath $installer `
+            -ArgumentList "/S", "/v/qn", "/norestart" `
+            -PassThru -NoNewWindow
+
+          Write-Host "安装进程 PID: $($proc.Id)"
+
+          # 轮询等待，同时检测超时
+          $killed = $false
+          while (-not $proc.HasExited) {
+            Start-Sleep -Seconds 15
+            $elapsed = ((Get-Date) - $proc.StartTime).TotalMinutes
+            Write-Host ("已等待 {0:N1} 分钟，进程状态: {1}" -f $elapsed, $proc.ProcessName)
+
+            if ((Get-Date) -gt $deadline) {
+              Write-Host "❌ 安装超过 $timeoutMinutes 分钟仍未完成，判定为卡死，强制终止。"
+              try {
+                $proc.Kill()
+                Start-Sleep -Seconds 5
+                # 清理可能残留的子进程
+                Get-Process -Name "HIP-SDK", "amd*", "Install*" -ErrorAction SilentlyContinue |
+                  Stop-Process -Force -ErrorAction SilentlyContinue
+              } catch {
+                Write-Host "终止进程时出错: $_"
+              }
+              $killed = $true
+              break
+            }
+          }
+
+          if ($killed) {
+            Write-Error "HIP SDK 安装卡死，已强制终止。"
+            exit 1
+          }
+
+          $exitCode = $proc.ExitCode
+          Write-Host "安装进程退出码: $exitCode"
+
+          # 退出码不为 0 时，进一步检查是否真的失败
+          if ($exitCode -ne 0) {
+            Write-Warning "安装程序返回非零退出码: $exitCode，检查关键文件是否存在..."
+          }
+
+          # 验证安装结果：检查关键目录和文件
+          $hipPath = "C:\Program Files\AMD\ROCm\7.1"
+          $requiredPaths = @(
+            "$hipPath\bin\amdhip64.dll",
+            "$hipPath\bin\clang.exe",
+            "$hipPath\include\hip\hip_runtime.h"
+          )
+
+          $missing = @()
+          foreach ($p in $requiredPaths) {
+            if (Test-Path $p) {
+              Write-Host "✅ 存在: $p"
+            } else {
+              Write-Host "❌ 缺失: $p"
+              $missing += $p
+            }
+          }
+
+          if ($missing.Count -gt 0) {
+            Write-Error "HIP SDK 安装不完整，缺失关键文件: $($missing -join ', ')"
+            exit 1
+          }
+
+          Write-Host "✅ HIP SDK 安装验证通过。"
 
       - name: 设置 HIP 环境变量
         shell: powershell
