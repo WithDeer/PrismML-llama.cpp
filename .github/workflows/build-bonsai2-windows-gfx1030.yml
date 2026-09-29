@@ -33,39 +33,38 @@ jobs:
         run: |
           choco install ninja -y
           refreshenv
-          # 验证 ninja 可用
           ninja --version
 
       # ============================================================
-      # 2. 下载 HIP SDK 安装程序
+      # 2. 下载 HIP SDK 安装程序（使用 curl.exe 加速）
       # ============================================================
       - name: 下载 HIP SDK
         shell: powershell
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: |
           # 请替换为 AMD 官网当前最新的 HIP SDK for Windows 下载地址
-          # 建议将安装程序上传到本仓库 Release（tag: hip-sdk）后使用 Release Asset URL
+          # 更可靠的方式：将安装程序上传到本仓库 Release（tag: hip-sdk），
+          # 然后改为 $url = "https://github.com/${{ github.repository }}/releases/download/hip-sdk/HIP-SDK.exe"
           $url = "https://download.amd.com/developer/eula/rocm-hub/AMD-Software-PRO-Edition-26.Q3-Win11-For-HIP.exe"
           $outFile = "$env:TEMP\HIP-SDK.exe"
 
           Write-Host "开始下载 HIP SDK: $url"
-          Invoke-WebRequest -Uri $url -OutFile $outFile -UseBasicParsing
+          # 使用 curl.exe 下载，-L 跟随重定向，--fail 在 HTTP 错误时失败，--retry 重试
+          curl.exe -L --fail --retry 3 --retry-delay 5 -o "$outFile" "$url"
 
           # 验证文件大小
           $size = (Get-Item $outFile).Length
           Write-Host "下载文件大小: $size bytes ($([math]::Round($size/1MB, 2)) MB)"
-
           if ($size -lt 100MB) {
             Write-Error "HIP SDK 下载不完整，文件大小异常（小于 100MB）。"
             exit 1
           }
 
-          # 输出 SHA256 供核对
           $hash = (Get-FileHash $outFile -Algorithm SHA256).Hash
           Write-Host "SHA256: $hash"
 
       # ============================================================
-      # 3. 安装 HIP SDK（含主动超时检测与安装验证）
+      # 3. 安装 HIP SDK（主动超时检测 + 安装验证）
       # ============================================================
       - name: 安装 HIP SDK
         shell: powershell
@@ -77,14 +76,12 @@ jobs:
 
           Write-Host "启动 HIP SDK 安装，主动超时阈值: $timeoutMinutes 分钟"
 
-          # 启动安装进程，不等待
           $proc = Start-Process -FilePath $installer `
             -ArgumentList "/S", "/v/qn", "/norestart" `
             -PassThru -NoNewWindow
 
           Write-Host "安装进程 PID: $($proc.Id)"
 
-          # 轮询等待，同时检测超时
           $killed = $false
           while (-not $proc.HasExited) {
             Start-Sleep -Seconds 15
@@ -96,7 +93,6 @@ jobs:
               try {
                 $proc.Kill()
                 Start-Sleep -Seconds 5
-                # 清理可能残留的子进程
                 Get-Process -Name "HIP-SDK", "amd*", "Install*" -ErrorAction SilentlyContinue |
                   Stop-Process -Force -ErrorAction SilentlyContinue
               } catch {
@@ -120,6 +116,7 @@ jobs:
           }
 
           # 验证安装结果：检查关键目录和文件
+          # 注意：HIP SDK 版本不同，路径中的版本号可能不同，请根据实际安装调整
           $hipPath = "C:\Program Files\AMD\ROCm\7.1"
           $requiredPaths = @(
             "$hipPath\bin\amdhip64.dll",
@@ -184,7 +181,6 @@ jobs:
         shell: bash
         run: |
           cd llama.cpp
-          # 修复 min/max 命名冲突（如果 hip.h 存在且未包含 algorithm）
           HIP_HEADER="ggml-cuda/vendors/hip.h"
           if [ -f "$HIP_HEADER" ]; then
             if ! grep -q "#include <algorithm>" "$HIP_HEADER"; then
@@ -241,7 +237,6 @@ jobs:
           copy llama.cpp\build\bin\llama-server.exe output\
           copy llama.cpp\build\bin\llama-cli.exe output\
 
-          # 复制 HIP SDK 关键 DLL
           $hipBin = "C:\Program Files\AMD\ROCm\7.1\bin"
           $dlls = @(
             "amdhip64.dll", "rocblas.dll", "hipblas.dll", "rocsolver.dll",
@@ -258,7 +253,6 @@ jobs:
             }
           }
 
-          # 写入构建信息
           @"
           Branch: bonsai2 (sudoingX/llama.cpp)
           Commit: $hash
