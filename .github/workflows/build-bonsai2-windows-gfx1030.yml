@@ -42,7 +42,7 @@ jobs:
         id: cache-hip
         with:
           path: C:\Program Files\AMD\ROCm
-          key: hip-sdk-7.2-${{ runner.os }}-v4
+          key: hip-sdk-7.2-${{ runner.os }}-v5
           restore-keys: |
             hip-sdk-7.2-${{ runner.os }}-
 
@@ -123,15 +123,15 @@ jobs:
           Write-Host "HIP_BIN  = $env:HIP_BIN"
 
       # ============================================================
-      # 6. FIX: Adjust clang HIP runtime wrapper header order
+      # 6. Patch clang HIP math headers to skip conflicting includes
       # ============================================================
-      - name: Fix clang HIP header order
+      - name: Patch clang HIP math headers
         shell: powershell
         run: |
           $hipPath = $env:HIP_PATH
           Write-Host "HIP_PATH = $hipPath"
 
-          # Find __clang_hip_runtime_wrapper.h
+          # Locate __clang_hip_runtime_wrapper.h
           $wrapper = Get-ChildItem -Path $hipPath -Recurse -Filter "__clang_hip_runtime_wrapper.h" -ErrorAction SilentlyContinue |
                      Select-Object -First 1
           if (-not $wrapper) {
@@ -141,49 +141,54 @@ jobs:
           $wrapperPath = $wrapper.FullName
           Write-Host "Found wrapper: $wrapperPath"
 
-          # Backup
-          Copy-Item $wrapperPath "$wrapperPath.bak" -Force
-
-          # Read content
-          $content = Get-Content $wrapperPath -Raw
-
-          # Check if already patched
-          if ($content -match "#include <__clang_cuda_math_forward_declares.h>") {
-            Write-Host "Wrapper already patched, skipping."
+          # Backup once
+          if (-not (Test-Path "$wrapperPath.bak")) {
+            Copy-Item $wrapperPath "$wrapperPath.bak" -Force
+            Write-Host "Backup created: $wrapperPath.bak"
           } else {
-            # Find the line with #include <cmath>
-            $lines = Get-Content $wrapperPath
-            $newLines = @()
-            $patched = $false
-
-            foreach ($line in $lines) {
-              if ($line -match "#include <cmath>" -and -not $patched) {
-                # Insert the forward declares include before <cmath>
-                $newLines += "#include <__clang_cuda_math_forward_declares.h>"
-                $newLines += $line
-                $patched = $true
-                Write-Host "Inserted forward declares before <cmath>"
-              } else {
-                $newLines += $line
-              }
-            }
-
-            if (-not $patched) {
-              Write-Error "#include <cmath> not found in wrapper header"
-              exit 1
-            }
-
-            # Write back
-            $newLines | Set-Content -Path $wrapperPath -Encoding UTF8
-            Write-Host "Wrapper header patched successfully."
+            Write-Host "Backup already exists, restoring from backup before re-patching"
+            Copy-Item "$wrapperPath.bak" $wrapperPath -Force
           }
+
+          # Read all lines
+          $lines = Get-Content $wrapperPath
+          $newLines = @()
+          $patched = 0
+
+          foreach ($line in $lines) {
+            # Comment out the two conflicting includes
+            if ($line -match '^\s*#include\s*<__clang_cuda_math_forward_declares\.h>') {
+              $newLines += "// PATCHED: $line"
+              Write-Host "Commented out: $line"
+              $patched++
+            }
+            elseif ($line -match '^\s*#include\s*<__clang_hip_cmath\.h>') {
+              $newLines += "// PATCHED: $line"
+              Write-Host "Commented out: $line"
+              $patched++
+            }
+            else {
+              $newLines += $line
+            }
+          }
+
+          if ($patched -eq 0) {
+            Write-Warning "No conflicting includes found. The header may have already been patched or layout changed."
+          } else {
+            Write-Host "Patched $patched conflicting include(s)."
+          }
+
+          # Write back
+          $newLines | Set-Content -Path $wrapperPath -Encoding UTF8
+          Write-Host "Wrapper header patched successfully."
 
           # Verify
           $verify = Get-Content $wrapperPath -Raw
-          if ($verify -match "#include <__clang_cuda_math_forward_declares.h>") {
-            Write-Host "Verification: forward declares header is present."
+          $remaining = ([regex]::Matches($verify, '^\s*#include\s*<__clang_(cuda_math_forward_declares|hip_cmath)\.h>', 'Multiline')).Count
+          if ($remaining -eq 0) {
+            Write-Host "Verification: no conflicting includes remain."
           } else {
-            Write-Warning "Verification: forward declares header NOT found."
+            Write-Warning "Verification: $remaining conflicting include(s) still present."
           }
 
       # ============================================================
