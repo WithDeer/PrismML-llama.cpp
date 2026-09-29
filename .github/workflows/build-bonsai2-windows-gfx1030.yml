@@ -74,16 +74,41 @@ jobs:
           $logFile = "$env:TEMP\hip-install.log"
           Write-Host "Starting silent HIP SDK installation..."
           $proc = Start-Process -FilePath $installer -ArgumentList "-install", "-log", $logFile -NoNewWindow -PassThru
-          $completed = $proc.WaitForExit(1500000) # 25分钟超时
+          $completed = $proc.WaitForExit(1500000) # 25 minutes
           if (-not $completed) {
             Write-Error "HIP SDK installation timed out."
             $proc.Kill()
             exit 1
           }
-          Write-Host "Installation process exited with code: $($proc.ExitCode)"
-          if (Test-Path $logFile) { Get-Content $logFile -Tail 50 }
-          if ($proc.ExitCode -ne 0) { Write-Error "HIP SDK installation failed with exit code $($proc.ExitCode)"; exit 1 }
-          Write-Host "HIP SDK installation completed successfully."
+          Write-Host "Installation process exited."
+          if (Test-Path $logFile) { Get-Content $logFile -Tail 30 }
+
+          # Do NOT rely on $proc.ExitCode; verify actual files instead
+          $hipPath = "C:\Program Files\AMD\ROCm\7.1"
+          if (-not (Test-Path $hipPath)) {
+            Write-Host "Expected path $hipPath not found, searching for actual ROCm directory..."
+            $found = Get-ChildItem "C:\Program Files\AMD\ROCm" -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) { $hipPath = $found.FullName }
+          }
+
+          $requiredFiles = @(
+            "$hipPath\bin\amdhip64.dll",
+            "$hipPath\bin\clang.exe"
+          )
+          $missing = @()
+          foreach ($f in $requiredFiles) {
+            if (Test-Path $f) {
+              Write-Host "OK: $f"
+            } else {
+              Write-Host "MISSING: $f"
+              $missing += $f
+            }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Error "HIP SDK installation incomplete. Missing: $($missing -join ', ')"
+            exit 1
+          }
+          Write-Host "HIP SDK installation verified."
 
       # ============================================================
       # 5. Set HIP Environment Variables
@@ -93,7 +118,6 @@ jobs:
         run: |
           $hipPath = "C:\Program Files\AMD\ROCm\7.1"
           if (-not (Test-Path $hipPath)) {
-            # Fallback: find the actual version directory
             $hipPath = (Get-ChildItem "C:\Program Files\AMD\ROCm" -Directory | Select-Object -First 1).FullName
           }
           echo "HIP_PATH=$hipPath" >> $env:GITHUB_ENV
