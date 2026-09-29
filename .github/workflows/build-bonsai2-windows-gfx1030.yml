@@ -25,17 +25,18 @@ jobs:
 
     steps:
       # ============================================================
-      # 1. Install Ninja
+      # 1. Install Ninja and 7-Zip
       # ============================================================
-      - name: Install Ninja
+      - name: Install Ninja and 7-Zip
         shell: powershell
         run: |
-          choco install ninja -y
+          choco install ninja 7zip -y
           refreshenv
           ninja --version
+          & "C:\Program Files\7-Zip\7z.exe" | Select-Object -First 3
 
       # ============================================================
-      # 2. Download HIP SDK with curl.exe
+      # 2. Download HIP SDK
       # ============================================================
       - name: Download HIP SDK
         shell: powershell
@@ -54,78 +55,89 @@ jobs:
             exit 1
           }
 
-          $hash = (Get-FileHash $outFile -Algorithm SHA256).Hash
-          Write-Host "SHA256: $hash"
-
       # ============================================================
-      # 3. Install HIP SDK with timeout detection
+      # 3. Extract HIP SDK using 7-Zip (bypass installer)
       # ============================================================
-      - name: Install HIP SDK
+      - name: Extract HIP SDK
         shell: powershell
-        timeout-minutes: 45
+        timeout-minutes: 30
         run: |
+          $sevenZip = "C:\Program Files\7-Zip\7z.exe"
           $installer = "$env:TEMP\HIP-SDK.exe"
-          $timeoutMinutes = 30
+          $root = "$env:TEMP\HIP-extracted"
 
-          $startTime = Get-Date
-          $deadline = $startTime.AddMinutes($timeoutMinutes)
+          New-Item -ItemType Directory -Path $root -Force | Out-Null
 
-          Write-Host "Starting HIP SDK installation. Timeout: $timeoutMinutes minutes"
-
-          $proc = Start-Process -FilePath $installer `
-            -ArgumentList "/S", "/v/qn", "/norestart" `
-            -PassThru -NoNewWindow
-
-          Write-Host "Installer PID: $($proc.Id)"
-
-          $killed = $false
-          while ($true) {
-            Start-Sleep -Seconds 15
-
-            $proc.Refresh()
-            if ($proc.HasExited) {
-              break
-            }
-
-            $elapsed = ((Get-Date) - $startTime).TotalMinutes
-            Write-Host ("Elapsed: {0:N1} minutes" -f $elapsed)
-
-            if ((Get-Date) -gt $deadline) {
-              Write-Host "Installation exceeded $timeoutMinutes minutes. Killing process."
-              try {
-                $proc.Kill()
-                Start-Sleep -Seconds 5
-                Get-Process -Name "HIP-SDK", "amd*", "Install*" -ErrorAction SilentlyContinue |
-                  Stop-Process -Force -ErrorAction SilentlyContinue
-              } catch {
-                Write-Host "Error killing process: $_"
-              }
-              $killed = $true
-              break
-            }
-          }
-
-          if ($killed) {
-            Write-Error "HIP SDK installation hung. Consider local build or self-hosted runner."
+          Write-Host "Stage 1: extracting installer"
+          & $sevenZip x $installer -o"$root" -y | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "7-Zip failed to extract installer (exit $LASTEXITCODE)"
             exit 1
           }
 
-          $exitCode = $proc.ExitCode
-          Write-Host "Installer exit code: $exitCode"
-
-          if ($exitCode -ne 0) {
-            Write-Warning "Installer returned non-zero exit code: $exitCode. Checking files..."
+          # Recursively extract nested archives (.cab, .msi, .7z, .zip)
+          for ($depth = 1; $depth -le 5; $depth++) {
+            $nested = Get-ChildItem -Path $root -Recurse -Include *.cab,*.msi,*.7z,*.zip -ErrorAction SilentlyContinue |
+                      Where-Object { $_.FullName -notmatch "extracted_" }
+            if (-not $nested) {
+              Write-Host "Stage $depth: no more nested archives found."
+              break
+            }
+            Write-Host "Stage $depth: extracting $($nested.Count) nested archive(s)"
+            foreach ($n in $nested) {
+              $out = Join-Path $n.DirectoryName ("extracted_" + $n.BaseName)
+              & $sevenZip x $n.FullName -o"$out" -y 2>&1 | Out-Null
+            }
           }
 
-          $hipPath = "C:\Program Files\AMD\ROCm\7.1"
-          $requiredPaths = @(
-            "$hipPath\bin\amdhip64.dll",
-            "$hipPath\bin\clang.exe",
-            "$hipPath\include\hip\hip_runtime.h"
+          # Locate key HIP SDK files
+          Write-Host "Searching for HIP SDK files..."
+          $amdhip = Get-ChildItem -Path $root -Recurse -Filter "amdhip64.dll" -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+          $clang  = Get-ChildItem -Path $root -Recurse -Filter "clang.exe" -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+
+          if (-not $amdhip) {
+            Write-Error "Could not find amdhip64.dll in extracted HIP SDK."
+            Write-Host "Extracted file tree (top-level):"
+            Get-ChildItem -Path $root -Recurse -Depth 3 | Select-Object -First 100 FullName | Format-Table
+            exit 1
+          }
+          if (-not $clang) {
+            Write-Error "Could not find clang.exe in extracted HIP SDK."
+            exit 1
+          }
+
+          $hipBin  = $amdhip.Directory.FullName
+          $hipRoot = Split-Path $hipBin -Parent
+
+          Write-Host "Found amdhip64.dll at: $($amdhip.FullName)"
+          Write-Host "Found clang.exe at:    $($clang.FullName)"
+          Write-Host "HIP root: $hipRoot"
+
+          # Persist paths for later steps
+          echo "HIP_PATH=$hipRoot" >> $env:GITHUB_ENV
+          echo "HIP_BIN=$hipBin" >> $env:GITHUB_ENV
+          echo "$hipBin" >> $env:GITHUB_PATH
+
+      # ============================================================
+      # 4. Verify HIP SDK extraction
+      # ============================================================
+      - name: Verify HIP SDK
+        shell: powershell
+        run: |
+          $hipPath = $env:HIP_PATH
+          $hipBin = $env:HIP_BIN
+          Write-Host "HIP_PATH = $hipPath"
+          Write-Host "HIP_BIN  = $hipBin"
+
+          $required = @(
+            "$hipBin\clang.exe",
+            "$hipBin\amdhip64.dll"
           )
 
           $missing = @()
-          foreach ($p in $requiredPaths) {
+          foreach ($p in $required) {
             if (Test-Path $p) {
               Write-Host "OK: $p"
             } else {
@@ -135,22 +147,29 @@ jobs:
           }
 
           if ($missing.Count -gt 0) {
-            Write-Error "HIP SDK installation incomplete. Missing: $($missing -join ', ')"
+            Write-Error "HIP SDK extraction incomplete. Missing: $($missing -join ', ')"
             exit 1
           }
 
-          Write-Host "HIP SDK installation verified."
+          # Check device lib path
+          $deviceLibCandidates = @(
+            "$hipPath\amdgcn\bitcode",
+            "$hipPath\lib\amdgcn\bitcode"
+          )
+          $found = $false
+          foreach ($d in $deviceLibCandidates) {
+            if (Test-Path $d) {
+              Write-Host "Device lib path: $d"
+              echo "HIP_DEVICE_LIB_PATH=$d" >> $env:GITHUB_ENV
+              $found = $true
+              break
+            }
+          }
+          if (-not $found) {
+            Write-Warning "Could not locate HIP_DEVICE_LIB_PATH. CMake may still find it automatically."
+          }
 
-      # ============================================================
-      # 4. Set HIP environment variables
-      # ============================================================
-      - name: Set HIP environment
-        shell: powershell
-        run: |
-          $hipPath = "C:\Program Files\AMD\ROCm\7.1"
-          echo "HIP_PATH=$hipPath" >> $env:GITHUB_ENV
-          echo "$hipPath\bin" >> $env:GITHUB_PATH
-          Write-Host "HIP_PATH set to: $hipPath"
+          Write-Host "HIP SDK verification passed."
 
       # ============================================================
       # 5. Clone bonsai2 branch
@@ -200,12 +219,15 @@ jobs:
         shell: powershell
         run: |
           cd llama.cpp
+          $hipBin = $env:HIP_BIN
+          $env:PATH = "$hipBin;$env:PATH"
+
           cmake -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DGGML_HIP=ON `
             -DAMDGPU_TARGETS=gfx1030 `
-            -DCMAKE_C_COMPILER=clang `
-            -DCMAKE_CXX_COMPILER=clang++ `
+            -DCMAKE_C_COMPILER="$hipBin\clang.exe" `
+            -DCMAKE_CXX_COMPILER="$hipBin\clang++.exe" `
             -DGGML_CUDA_BATCH_INVARIANT=ON `
             -DLLAMA_BUILD_SERVER=ON `
             -DLLAMA_BUILD_EXAMPLES=OFF `
@@ -216,9 +238,11 @@ jobs:
       # ============================================================
       - name: Build
         shell: powershell
-        timeout-minutes: 60
+        timeout-minutes: 90
         run: |
           cd llama.cpp
+          $env:PATH = "$($env:HIP_BIN);$env:PATH"
+
           cmake --build build --target llama-server llama-cli -j $env:NUMBER_OF_PROCESSORS
 
           Write-Host "Build completed. Artifacts:"
@@ -232,12 +256,12 @@ jobs:
         run: |
           $hash = "${{ steps.get_commit.outputs.COMMIT_HASH }}"
           $date = Get-Date -Format 'yyyyMMdd'
+          $hipBin = $env:HIP_BIN
           mkdir output
 
           copy llama.cpp\build\bin\llama-server.exe output\
           copy llama.cpp\build\bin\llama-cli.exe output\
 
-          $hipBin = "C:\Program Files\AMD\ROCm\7.1\bin"
           $dlls = @(
             "amdhip64.dll", "rocblas.dll", "hipblas.dll", "rocsolver.dll",
             "rocsparse.dll", "hipfft.dll", "rccl.dll", "hiprand.dll",
@@ -292,11 +316,5 @@ jobs:
             - **Target GPU**: gfx1030 (RX 6800 XT)
             - **Features**: PQ2_0 support + MTP Hadamard fix + PTQ1_0 MMV kernel
             - **Build**: ${{ github.run_id }}
-
-            ### Run example
-            ```powershell
-            .\llama-server.exe -m "D:\ai-soft\AI-model\Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0.gguf" `
-              --mmproj "D:\ai-soft\AI-model\Ternary-Bonsai-27B-mmproj-Q8_0.gguf" `
-              -ngl 99 -c 65536 -fa on -ctk q8_0 -ctv q8_0 `
-              --load-mode none -np 1 --jinja `
-              --spec-type draft-mtp --spec-draft-n-max 1 --port 8080
+          files: bonsai2-win-gfx1030-*.zip
+          generate_release_notes: false
