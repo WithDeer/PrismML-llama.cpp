@@ -45,7 +45,7 @@ jobs:
         run: |
           # 请替换为 AMD 官网当前最新的 HIP SDK for Windows 下载地址
           # 建议将安装程序上传到本仓库 Release（tag: hip-sdk）后使用 Release Asset URL
-          $url = "https://github.com/${{ github.repository }}/releases/download/hip-sdk/HIP-SDK.exe"
+          $url = "https://download.amd.com/developer/eula/rocm-hub/AMD-Software-PRO-Edition-26.Q3-Win11-For-HIP.exe"
           $outFile = "$env:TEMP\HIP-SDK.exe"
 
           Write-Host "开始下载 HIP SDK: $url"
