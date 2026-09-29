@@ -1,34 +1,225 @@
+name: Build Bonsai2 MTP for Windows gfx1030
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create GitHub Release'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: '0 2 * * 1'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
       # ============================================================
-      # 3. Install HIP SDK Silently (using official -install flag)
+      # 1. Install Ninja
+      # ============================================================
+      - name: Install Ninja
+        shell: powershell
+        run: |
+          choco install ninja -y
+          refreshenv
+          ninja --version
+
+      # ============================================================
+      # 2. Cache HIP SDK installation
+      # ============================================================
+      - name: Cache HIP SDK
+        uses: actions/cache@v4
+        id: cache-hip
+        with:
+          path: C:\Program Files\AMD\ROCm
+          key: hip-sdk-7.1-${{ runner.os }}-v1
+          restore-keys: |
+            hip-sdk-7.1-${{ runner.os }}-
+
+      # ============================================================
+      # 3. Download HIP SDK (if not cached)
+      # ============================================================
+      - name: Download HIP SDK
+        if: steps.cache-hip.outputs.cache-hit != 'true'
+        shell: powershell
+        timeout-minutes: 30
+        run: |
+          $url = "https://download.amd.com/developer/eula/rocm-hub/AMD-Software-PRO-Edition-26.Q3-Win11-For-HIP.exe"
+          $outFile = "$env:TEMP\HIP-SDK.exe"
+          Write-Host "Downloading HIP SDK from: $url"
+          curl.exe -L --fail --retry 3 --retry-delay 5 -o "$outFile" "$url"
+          $size = (Get-Item $outFile).Length
+          Write-Host "Downloaded size: $size bytes ($([math]::Round($size/1MB, 2)) MB)"
+          if ($size -lt 100MB) { Write-Error "HIP SDK download incomplete."; exit 1 }
+
+      # ============================================================
+      # 4. Install HIP SDK Silently (if not cached)
       # ============================================================
       - name: Install HIP SDK Silently
+        if: steps.cache-hip.outputs.cache-hit != 'true'
         shell: powershell
         timeout-minutes: 30
         run: |
           $installer = "$env:TEMP\HIP-SDK.exe"
           $logFile = "$env:TEMP\hip-install.log"
-
           Write-Host "Starting silent HIP SDK installation..."
-          # 使用官方 -install 参数，并记录日志
-          $proc = Start-Process -FilePath $installer `
-            -ArgumentList "-install", "-log", $logFile `
-            -NoNewWindow -PassThru
-
+          $proc = Start-Process -FilePath $installer -ArgumentList "-install", "-log", $logFile -NoNewWindow -PassThru
           $completed = $proc.WaitForExit(1500000) # 25分钟超时
           if (-not $completed) {
-            Write-Error "HIP SDK installation timed out after 25 minutes. Killing process."
+            Write-Error "HIP SDK installation timed out."
             $proc.Kill()
             exit 1
           }
-
           Write-Host "Installation process exited with code: $($proc.ExitCode)"
-          if (Test-Path $logFile) {
-            Write-Host "--- Installation Log (tail) ---"
-            Get-Content $logFile -Tail 50
-          }
-
-          if ($proc.ExitCode -ne 0) {
-            Write-Error "HIP SDK installation failed with exit code $($proc.ExitCode)"
-            exit 1
-          }
+          if (Test-Path $logFile) { Get-Content $logFile -Tail 50 }
+          if ($proc.ExitCode -ne 0) { Write-Error "HIP SDK installation failed with exit code $($proc.ExitCode)"; exit 1 }
           Write-Host "HIP SDK installation completed successfully."
+
+      # ============================================================
+      # 5. Set HIP Environment Variables
+      # ============================================================
+      - name: Set HIP Environment
+        shell: powershell
+        run: |
+          $hipPath = "C:\Program Files\AMD\ROCm\7.1"
+          if (-not (Test-Path $hipPath)) {
+            # Fallback: find the actual version directory
+            $hipPath = (Get-ChildItem "C:\Program Files\AMD\ROCm" -Directory | Select-Object -First 1).FullName
+          }
+          echo "HIP_PATH=$hipPath" >> $env:GITHUB_ENV
+          echo "$hipPath\bin" >> $env:GITHUB_PATH
+          Write-Host "HIP_PATH set to: $hipPath"
+
+      # ============================================================
+      # 6. Clone bonsai2 branch
+      # ============================================================
+      - name: Clone bonsai2 branch
+        shell: bash
+        run: |
+          git clone --depth 1 -b bonsai2 https://github.com/sudoingX/llama.cpp.git
+          cd llama.cpp
+          git log -1 --oneline
+
+      # ============================================================
+      # 7. Get commit hash
+      # ============================================================
+      - name: Get commit hash
+        id: get_commit
+        shell: bash
+        run: |
+          cd llama.cpp
+          HASH=$(git rev-parse --short HEAD)
+          echo "COMMIT_HASH=$HASH" >> $GITHUB_OUTPUT
+          echo "Current commit: $HASH"
+
+      # ============================================================
+      # 8. Apply Windows compile patch
+      # ============================================================
+      - name: Apply Windows compile patch
+        shell: bash
+        run: |
+          cd llama.cpp
+          HIP_HEADER="ggml-cuda/vendors/hip.h"
+          if [ -f "$HIP_HEADER" ]; then
+            if ! grep -q "#include <algorithm>" "$HIP_HEADER"; then
+              echo "Adding algorithm header to $HIP_HEADER"
+              sed -i '1i #include <algorithm>\nusing std::min; using std::max;' "$HIP_HEADER"
+            fi
+          fi
+
+      # ============================================================
+      # 9. Configure CMake
+      # ============================================================
+      - name: Configure CMake
+        shell: powershell
+        run: |
+          cd llama.cpp
+          $hipPath = $env:HIP_PATH
+          $env:PATH = "$hipPath\bin;$env:PATH"
+          cmake -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DGGML_HIP=ON `
+            -DAMDGPU_TARGETS=gfx1030 `
+            -DCMAKE_C_COMPILER="$hipPath\bin\clang.exe" `
+            -DCMAKE_CXX_COMPILER="$hipPath\bin\clang++.exe" `
+            -DGGML_CUDA_BATCH_INVARIANT=ON `
+            -DLLAMA_BUILD_SERVER=ON `
+            -DLLAMA_BUILD_EXAMPLES=OFF `
+            -DLLAMA_BUILD_TESTS=OFF
+
+      # ============================================================
+      # 10. Build
+      # ============================================================
+      - name: Build
+        shell: powershell
+        timeout-minutes: 90
+        run: |
+          cd llama.cpp
+          $env:PATH = "$($env:HIP_PATH)\bin;$env:PATH"
+          cmake --build build --target llama-server llama-cli -j $env:NUMBER_OF_PROCESSORS
+          Write-Host "Build completed. Artifacts:"
+          Get-ChildItem build\bin\ | Format-Table Name, Length
+
+      # ============================================================
+      # 11. Collect artifacts
+      # ============================================================
+      - name: Collect artifacts
+        shell: powershell
+        run: |
+          $hash = "${{ steps.get_commit.outputs.COMMIT_HASH }}"
+          $date = Get-Date -Format 'yyyyMMdd'
+          $hipBin = "$env:HIP_PATH\bin"
+          mkdir output
+          copy llama.cpp\build\bin\llama-server.exe output\
+          copy llama.cpp\build\bin\llama-cli.exe output\
+          $dlls = @("amdhip64.dll", "rocblas.dll", "hipblas.dll", "rocsolver.dll", "rocsparse.dll", "hipfft.dll", "rccl.dll", "hiprand.dll", "rocrand.dll", "hipcub.dll", "roctracer64.dll")
+          foreach ($dll in $dlls) {
+            $src = Join-Path $hipBin $dll
+            if (Test-Path $src) { copy $src output\ }
+          }
+          @"
+          Branch: bonsai2 (sudoingX/llama.cpp)
+          Commit: $hash
+          Build Date: $date
+          Target GPU: gfx1030 (RX 6800 XT)
+          Features: PQ2_0 support + MTP Hadamard fix + PTQ1_0 MMV kernel
+          "@ | Out-File output\BUILD_INFO.txt -Encoding UTF8
+          Compress-Archive -Path output\* -DestinationPath "bonsai2-win-gfx1030-$hash-$date.zip"
+
+      # ============================================================
+      # 12. Upload artifacts
+      # ============================================================
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bonsai2-win-gfx1030-${{ steps.get_commit.outputs.COMMIT_HASH }}
+          path: bonsai2-win-gfx1030-*.zip
+          retention-days: 30
+
+      # ============================================================
+      # 13. Create Release (optional)
+      # ============================================================
+      - name: Create Release
+        if: github.event.inputs.create_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: bonsai2-win-gfx1030-${{ steps.get_commit.outputs.COMMIT_HASH }}
+          name: "Bonsai2 MTP Windows gfx1030 - ${{ steps.get_commit.outputs.COMMIT_HASH }}"
+          body: |
+            Built from `sudoingX/llama.cpp` bonsai2 branch.
+            - **Commit**: `${{ steps.get_commit.outputs.COMMIT_HASH }}`
+            - **Target GPU**: gfx1030 (RX 6800 XT)
+            - **Features**: PQ2_0 support + MTP Hadamard fix + PTQ1_0 MMV kernel
+            - **Build**: ${{ github.run_id }}
+          files: bonsai2-win-gfx1030-*.zip
+          generate_release_notes: false
