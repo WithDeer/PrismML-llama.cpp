@@ -217,9 +217,11 @@ jobs:
           cd llama.cpp
           $env:PATH = "$($env:HIP_BIN);$env:PATH"
           cmake --build build --target llama-server llama-cli -j $env:NUMBER_OF_PROCESSORS
-          Write-Host "=== build\bin contents ==="
           Get-ChildItem build\bin\ | Format-Table Name, Length
 
+      # ============================================================
+      # 关键修复：把 zip 输出到稳定的 release/ 目录，便于后续引用
+      # ============================================================
       - name: Collect artifacts
         shell: powershell
         run: |
@@ -227,6 +229,7 @@ jobs:
           $date = Get-Date -Format 'yyyyMMdd'
           $hipPath = $env:HIP_PATH
           mkdir output
+          mkdir release
 
           # llama.cpp 自身的运行时（exe + dll）
           Copy-Item llama.cpp\build\bin\*.exe output\ -ErrorAction SilentlyContinue
@@ -264,23 +267,21 @@ jobs:
           Features: PQ2_0 support + MTP Hadamard fix + PTQ1_0 MMV kernel
           "@ | Out-File output\BUILD_INFO.txt -Encoding UTF8
 
-          Write-Host "=== Files in output ==="
-          Get-ChildItem output\ | Sort-Object Name | Format-Table Name, Length
+          # 打包并同时放到 release/ 目录
+          $zipName = "bonsai2-win-gfx1030-$hash-$date.zip"
+          Compress-Archive -Path output\* -DestinationPath $zipName -Force
+          Copy-Item $zipName "release\$zipName" -Force
 
-          Compress-Archive -Path output\* -DestinationPath "bonsai2-win-gfx1030-$hash-$date.zip" -Force
-          Write-Host "=== Final zip ==="
-          Get-ChildItem *.zip | Format-Table Name, Length
+          Write-Host "=== Release dir contents ==="
+          Get-ChildItem release\ | Format-Table Name, Length
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: bonsai2-win-gfx1030-${{ steps.get_commit.outputs.COMMIT_HASH }}
-          path: bonsai2-win-gfx1030-*.zip
+          path: release/*.zip
           retention-days: 30
 
-      # ============================================================
-      # 新增：检查该 commit 是否已发布过 release
-      # ============================================================
       - name: Check if release exists
         id: check_release
         shell: powershell
@@ -300,13 +301,6 @@ jobs:
             echo "EXISTS=false" >> $env:GITHUB_OUTPUT
           }
 
-      # ============================================================
-      # 新增：推送构建物到 GitHub Release
-      # 触发条件：
-      #   - 手动触发且用户选择 create_release=true
-      #   - 或 push 到 main / 定时触发（自动 release）
-      # 且该 commit 尚未 release 过
-      # ============================================================
       - name: Create Release
         if: |
           steps.check_release.outputs.EXISTS == 'false' && (
@@ -322,6 +316,8 @@ jobs:
           prerelease: false
           make_latest: true
           generate_release_notes: false
+          # 关键修复：使用绝对路径 + ${{ github.workspace }} 前缀
+          files: ${{ github.workspace }}/release/bonsai2-win-gfx1030-*.zip
           body: |
             ## Bonsai2 MTP Windows Build for RX 6800 XT
 
