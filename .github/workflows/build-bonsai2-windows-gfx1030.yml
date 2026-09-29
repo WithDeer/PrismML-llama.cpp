@@ -66,7 +66,9 @@ jobs:
         run: |
           $installer = "$env:TEMP\HIP-SDK.exe"
           $timeoutMinutes = 30
-          $deadline = (Get-Date).AddMinutes($timeoutMinutes)
+
+          $startTime = Get-Date
+          $deadline = $startTime.AddMinutes($timeoutMinutes)
 
           Write-Host "Starting HIP SDK installation. Timeout: $timeoutMinutes minutes"
 
@@ -77,10 +79,16 @@ jobs:
           Write-Host "Installer PID: $($proc.Id)"
 
           $killed = $false
-          while (-not $proc.HasExited) {
+          while ($true) {
             Start-Sleep -Seconds 15
-            $elapsed = ((Get-Date) - $proc.StartTime).TotalMinutes
-            Write-Host ("Elapsed: {0:N1} minutes, process: {1}" -f $elapsed, $proc.ProcessName)
+
+            $proc.Refresh()
+            if ($proc.HasExited) {
+              break
+            }
+
+            $elapsed = ((Get-Date) - $startTime).TotalMinutes
+            Write-Host ("Elapsed: {0:N1} minutes" -f $elapsed)
 
             if ((Get-Date) -gt $deadline) {
               Write-Host "Installation exceeded $timeoutMinutes minutes. Killing process."
