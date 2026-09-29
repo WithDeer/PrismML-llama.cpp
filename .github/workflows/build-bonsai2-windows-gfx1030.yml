@@ -24,9 +24,6 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      # ============================================================
-      # 1. Install Ninja
-      # ============================================================
       - name: Install Ninja
         shell: powershell
         run: |
@@ -34,21 +31,15 @@ jobs:
           refreshenv
           ninja --version
 
-      # ============================================================
-      # 2. Cache HIP SDK installation
-      # ============================================================
       - name: Cache HIP SDK
         uses: actions/cache@v4
         id: cache-hip
         with:
           path: C:\Program Files\AMD\ROCm
-          key: hip-sdk-7.2-${{ runner.os }}-v5
+          key: hip-sdk-7.2-${{ runner.os }}-v6
           restore-keys: |
             hip-sdk-7.2-${{ runner.os }}-
 
-      # ============================================================
-      # 3. Download HIP SDK (if not cached)
-      # ============================================================
       - name: Download HIP SDK
         if: steps.cache-hip.outputs.cache-hit != 'true'
         shell: powershell
@@ -56,15 +47,10 @@ jobs:
         run: |
           $url = "https://download.amd.com/developer/eula/rocm-hub/AMD-Software-PRO-Edition-26.Q3-Win11-For-HIP.exe"
           $outFile = "$env:TEMP\HIP-SDK.exe"
-          Write-Host "Downloading HIP SDK from: $url"
           curl.exe -L --fail --retry 3 --retry-delay 5 -o "$outFile" "$url"
           $size = (Get-Item $outFile).Length
-          Write-Host "Downloaded size: $size bytes ($([math]::Round($size/1MB, 2)) MB)"
           if ($size -lt 100MB) { Write-Error "HIP SDK download incomplete."; exit 1 }
 
-      # ============================================================
-      # 4. Install HIP SDK Silently (if not cached)
-      # ============================================================
       - name: Install HIP SDK Silently
         if: steps.cache-hip.outputs.cache-hit != 'true'
         shell: powershell
@@ -72,38 +58,21 @@ jobs:
         run: |
           $installer = "$env:TEMP\HIP-SDK.exe"
           $logFile = "$env:TEMP\hip-install.log"
-          Write-Host "Starting silent HIP SDK installation..."
           $proc = Start-Process -FilePath $installer -ArgumentList "-install", "-log", $logFile -NoNewWindow -PassThru
           $completed = $proc.WaitForExit(1500000)
-          if (-not $completed) {
-            Write-Error "HIP SDK installation timed out."
-            $proc.Kill()
-            exit 1
-          }
-          Write-Host "Installation process exited."
-          if (Test-Path $logFile) { Get-Content $logFile -Tail 20 }
+          if (-not $completed) { $proc.Kill(); exit 1 }
+          if (Test-Path $logFile) { Get-Content $logFile -Tail 10 }
 
           $rocmBase = "C:\Program Files\AMD\ROCm"
           $hipPath = Get-ChildItem $rocmBase -Directory -ErrorAction SilentlyContinue |
                      Sort-Object Name -Descending | Select-Object -First 1
-          if (-not $hipPath) { Write-Error "No ROCm directory found"; exit 1 }
           $hipPath = $hipPath.FullName
-          Write-Host "Detected HIP SDK path: $hipPath"
-
           $clang = Get-ChildItem -Path $hipPath -Recurse -Filter "clang.exe" -ErrorAction SilentlyContinue |
                    Select-Object -First 1
-          $amdhip = Get-ChildItem -Path $hipPath -Recurse -Filter "amdhip64*.dll" -ErrorAction SilentlyContinue |
-                    Select-Object -First 1
-          if (-not $clang) { Write-Error "clang.exe not found"; exit 1 }
-          if (-not $amdhip) { Write-Error "amdhip64*.dll not found"; exit 1 }
-
           echo "HIP_PATH=$hipPath" >> $env:GITHUB_ENV
           echo "HIP_BIN=$($clang.Directory.FullName)" >> $env:GITHUB_ENV
           echo "$($clang.Directory.FullName)" >> $env:GITHUB_PATH
 
-      # ============================================================
-      # 5. Set HIP Environment Variables (also for cached case)
-      # ============================================================
       - name: Set HIP Environment
         shell: powershell
         run: |
@@ -123,77 +92,82 @@ jobs:
           Write-Host "HIP_BIN  = $env:HIP_BIN"
 
       # ============================================================
-      # 6. Patch clang HIP math headers to skip conflicting includes
+      # Patch clang HIP math headers (v2)
+      # 1. 恢复 __clang_hip_cmath.h 的包含（设备端需要）
+      # 2. 注释掉 __clang_cuda_math_forward_declares.h（避免 __device__ 纯声明与 MSVC 冲突）
+      # 3. 给 __clang_cuda_complex_builtins.h 改用 __builtin_*
       # ============================================================
       - name: Patch clang HIP math headers
         shell: powershell
         run: |
           $hipPath = $env:HIP_PATH
-          Write-Host "HIP_PATH = $hipPath"
 
-          # Locate __clang_hip_runtime_wrapper.h
+          # --- Locate the header directory ---
           $wrapper = Get-ChildItem -Path $hipPath -Recurse -Filter "__clang_hip_runtime_wrapper.h" -ErrorAction SilentlyContinue |
                      Select-Object -First 1
-          if (-not $wrapper) {
-            Write-Error "__clang_hip_runtime_wrapper.h not found under $hipPath"
-            exit 1
-          }
+          if (-not $wrapper) { Write-Error "__clang_hip_runtime_wrapper.h not found"; exit 1 }
+          $headerDir = $wrapper.Directory.FullName
           $wrapperPath = $wrapper.FullName
-          Write-Host "Found wrapper: $wrapperPath"
+          Write-Host "Header dir: $headerDir"
 
-          # Backup once
-          if (-not (Test-Path "$wrapperPath.bak")) {
+          # =========================================================
+          # Step 1: Patch __clang_hip_runtime_wrapper.h
+          # =========================================================
+          $wrapperContent = Get-Content $wrapperPath -Raw
+          if ($wrapperContent -notmatch "PATCHED_V2") {
             Copy-Item $wrapperPath "$wrapperPath.bak" -Force
-            Write-Host "Backup created: $wrapperPath.bak"
-          } else {
-            Write-Host "Backup already exists, restoring from backup before re-patching"
-            Copy-Item "$wrapperPath.bak" $wrapperPath -Force
-          }
-
-          # Read all lines
-          $lines = Get-Content $wrapperPath
-          $newLines = @()
-          $patched = 0
-
-          foreach ($line in $lines) {
-            # Comment out the two conflicting includes
-            if ($line -match '^\s*#include\s*<__clang_cuda_math_forward_declares\.h>') {
-              $newLines += "// PATCHED: $line"
-              Write-Host "Commented out: $line"
-              $patched++
+            $lines = Get-Content $wrapperPath
+            $newLines = @()
+            $newLines += "// PATCHED_V2"
+            foreach ($line in $lines) {
+              if ($line -match '^\s*#include\s*<__clang_cuda_math_forward_declares\.h>') {
+                $newLines += "// PATCHED_V2: $line"
+              } elseif ($line -match '^\s*#include\s*<__clang_hip_cmath\.h>') {
+                # 恢复 __clang_hip_cmath.h（设备端需要）
+                $newLines += $line
+              } else {
+                $newLines += $line
+              }
             }
-            elseif ($line -match '^\s*#include\s*<__clang_hip_cmath\.h>') {
-              $newLines += "// PATCHED: $line"
-              Write-Host "Commented out: $line"
-              $patched++
-            }
-            else {
-              $newLines += $line
-            }
-          }
-
-          if ($patched -eq 0) {
-            Write-Warning "No conflicting includes found. The header may have already been patched or layout changed."
+            $newLines | Set-Content -Path $wrapperPath -Encoding UTF8
+            Write-Host "Patched __clang_hip_runtime_wrapper.h"
           } else {
-            Write-Host "Patched $patched conflicting include(s)."
+            Write-Host "__clang_hip_runtime_wrapper.h already patched"
           }
 
-          # Write back
-          $newLines | Set-Content -Path $wrapperPath -Encoding UTF8
-          Write-Host "Wrapper header patched successfully."
-
-          # Verify
-          $verify = Get-Content $wrapperPath -Raw
-          $remaining = ([regex]::Matches($verify, '^\s*#include\s*<__clang_(cuda_math_forward_declares|hip_cmath)\.h>', 'Multiline')).Count
-          if ($remaining -eq 0) {
-            Write-Host "Verification: no conflicting includes remain."
+          # =========================================================
+          # Step 2: Patch __clang_cuda_complex_builtins.h
+          # =========================================================
+          $complexHeader = Join-Path $headerDir "__clang_cuda_complex_builtins.h"
+          if (Test-Path $complexHeader) {
+            $content = Get-Content $complexHeader -Raw
+            if ($content -notmatch "PATCHED_V2") {
+              Copy-Item $complexHeader "$complexHeader.bak" -Force
+              $content = $content -replace '#define _ISNANd std::isnan', '#define _ISNANd __builtin_isnan // PATCHED_V2'
+              $content = $content -replace '#define _ISINFd std::isinf', '#define _ISINFd __builtin_isinf // PATCHED_V2'
+              $content = $content -replace '#define _COPYSIGNd std::copysign', '#define _COPYSIGNd __builtin_copysign // PATCHED_V2'
+              Set-Content -Path $complexHeader -Value $content -Encoding UTF8
+              Write-Host "Patched __clang_cuda_complex_builtins.h"
+            } else {
+              Write-Host "__clang_cuda_complex_builtins.h already patched"
+            }
           } else {
-            Write-Warning "Verification: $remaining conflicting include(s) still present."
+            Write-Warning "__clang_cuda_complex_builtins.h not found"
           }
 
-      # ============================================================
-      # 7. Clone bonsai2 branch
-      # ============================================================
+          # =========================================================
+          # Step 3: Verify
+          # =========================================================
+          $verifyWrapper = Get-Content $wrapperPath -Raw
+          $remainingForward = ([regex]::Matches($verifyWrapper, '^\s*#include\s*<__clang_cuda_math_forward_declares\.h>', 'Multiline')).Count
+          $hasCmath = ($verifyWrapper -match '#include\s*<__clang_hip_cmath\.h>')
+          Write-Host "Remaining forward declares: $remainingForward (should be 0)"
+          Write-Host "hip_cmath included: $hasCmath (should be True)"
+
+          $verifyComplex = Get-Content $complexHeader -Raw
+          $hasBuiltin = ($verifyComplex -match '__builtin_isnan')
+          Write-Host "complex_builtins patched: $hasBuiltin (should be True)"
+
       - name: Clone bonsai2 branch
         shell: bash
         run: |
@@ -201,9 +175,6 @@ jobs:
           cd llama.cpp
           git log -1 --oneline
 
-      # ============================================================
-      # 8. Get commit hash
-      # ============================================================
       - name: Get commit hash
         id: get_commit
         shell: bash
@@ -213,9 +184,6 @@ jobs:
           echo "COMMIT_HASH=$HASH" >> $GITHUB_OUTPUT
           echo "Current commit: $HASH"
 
-      # ============================================================
-      # 9. Apply Windows compile patch
-      # ============================================================
       - name: Apply Windows compile patch
         shell: bash
         run: |
@@ -223,14 +191,10 @@ jobs:
           HIP_HEADER="ggml-cuda/vendors/hip.h"
           if [ -f "$HIP_HEADER" ]; then
             if ! grep -q "#include <algorithm>" "$HIP_HEADER"; then
-              echo "Adding algorithm header to $HIP_HEADER"
               sed -i '1i #include <algorithm>\nusing std::min; using std::max;' "$HIP_HEADER"
             fi
           fi
 
-      # ============================================================
-      # 10. Configure CMake
-      # ============================================================
       - name: Configure CMake
         shell: powershell
         run: |
@@ -251,9 +215,6 @@ jobs:
             -DLLAMA_BUILD_EXAMPLES=OFF `
             -DLLAMA_BUILD_TESTS=OFF
 
-      # ============================================================
-      # 11. Build
-      # ============================================================
       - name: Build
         shell: powershell
         timeout-minutes: 90
@@ -261,12 +222,8 @@ jobs:
           cd llama.cpp
           $env:PATH = "$($env:HIP_BIN);$env:PATH"
           cmake --build build --target llama-server llama-cli -j $env:NUMBER_OF_PROCESSORS
-          Write-Host "Build completed. Artifacts:"
           Get-ChildItem build\bin\ | Format-Table Name, Length
 
-      # ============================================================
-      # 12. Collect artifacts
-      # ============================================================
       - name: Collect artifacts
         shell: powershell
         run: |
@@ -286,12 +243,7 @@ jobs:
           foreach ($pattern in $dllNames) {
             $found = Get-ChildItem -Path $hipPath -Recurse -Filter $pattern -ErrorAction SilentlyContinue |
                      Select-Object -First 1
-            if ($found) {
-              copy $found.FullName output\
-              Write-Host "Copied $($found.Name)"
-            } else {
-              Write-Host "Skipped missing pattern $pattern"
-            }
+            if ($found) { copy $found.FullName output\ }
           }
 
           @"
@@ -305,12 +257,6 @@ jobs:
 
           Compress-Archive -Path output\* -DestinationPath "bonsai2-win-gfx1030-$hash-$date.zip"
 
-          Write-Host "Packaging completed."
-          Get-ChildItem *.zip | Format-Table Name, Length
-
-      # ============================================================
-      # 13. Upload artifacts
-      # ============================================================
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -318,9 +264,6 @@ jobs:
           path: bonsai2-win-gfx1030-*.zip
           retention-days: 30
 
-      # ============================================================
-      # 14. Create Release (optional)
-      # ============================================================
       - name: Create Release
         if: github.event.inputs.create_release == 'true'
         uses: softprops/action-gh-release@v2
@@ -329,9 +272,7 @@ jobs:
           name: "Bonsai2 MTP Windows gfx1030 - ${{ steps.get_commit.outputs.COMMIT_HASH }}"
           body: |
             Built from `sudoingX/llama.cpp` bonsai2 branch.
-            - **Commit**: `${{ steps.get_commit.outputs.COMMIT_HASH }}`
-            - **Target GPU**: gfx1030 (RX 6800 XT)
-            - **Features**: PQ2_0 support + MTP Hadamard fix + PTQ1_0 MMV kernel
-            - **Build**: ${{ github.run_id }}
+            - Commit: `${{ steps.get_commit.outputs.COMMIT_HASH }}`
+            - Target GPU: gfx1030 (RX 6800 XT)
           files: bonsai2-win-gfx1030-*.zip
           generate_release_notes: false
