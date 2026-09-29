@@ -25,29 +25,57 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      # ========== 1. 安装 Ninja ==========
+      # ============================================================
+      # 1. 安装 Ninja 构建工具
+      # ============================================================
       - name: 安装 Ninja
+        shell: powershell
         run: |
           choco install ninja -y
           refreshenv
+          # 验证 ninja 可用
+          ninja --version
 
-      # ========== 2. 下载并安装 HIP SDK ==========
+      # ============================================================
+      # 2. 下载 HIP SDK 安装程序
+      # ============================================================
       - name: 下载 HIP SDK
         shell: powershell
+        timeout-minutes: 20
         run: |
           # 请替换为 AMD 官网当前最新的 HIP SDK for Windows 下载地址
-          $url = "https://download.amd.com/developer/eula/rocm-hub/AMD-Software-PRO-Edition-26.Q3-Win11-For-HIP.exe"
-          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\HIP-SDK.exe" -UseBasicParsing
+          # 建议将安装程序上传到本仓库 Release（tag: hip-sdk）后使用 Release Asset URL
+          $url = "https://github.com/${{ github.repository }}/releases/download/hip-sdk/HIP-SDK.exe"
+          $outFile = "$env:TEMP\HIP-SDK.exe"
 
-            - name: 安装 HIP SDK
+          Write-Host "开始下载 HIP SDK: $url"
+          Invoke-WebRequest -Uri $url -OutFile $outFile -UseBasicParsing
+
+          # 验证文件大小
+          $size = (Get-Item $outFile).Length
+          Write-Host "下载文件大小: $size bytes ($([math]::Round($size/1MB, 2)) MB)"
+
+          if ($size -lt 100MB) {
+            Write-Error "HIP SDK 下载不完整，文件大小异常（小于 100MB）。"
+            exit 1
+          }
+
+          # 输出 SHA256 供核对
+          $hash = (Get-FileHash $outFile -Algorithm SHA256).Hash
+          Write-Host "SHA256: $hash"
+
+      # ============================================================
+      # 3. 安装 HIP SDK（含主动超时检测与安装验证）
+      # ============================================================
+      - name: 安装 HIP SDK
         shell: powershell
-        timeout-minutes: 45          # 兜底硬超时，防止脚本自身挂掉
+        timeout-minutes: 45
         run: |
           $installer = "$env:TEMP\HIP-SDK.exe"
-          $timeoutMinutes = 30       # 主动超时阈值
+          $timeoutMinutes = 30
           $deadline = (Get-Date).AddMinutes($timeoutMinutes)
 
-          Write-Host "启动 HIP SDK 安装，超时阈值: $timeoutMinutes 分钟"
+          Write-Host "启动 HIP SDK 安装，主动超时阈值: $timeoutMinutes 分钟"
 
           # 启动安装进程，不等待
           $proc = Start-Process -FilePath $installer `
@@ -80,16 +108,15 @@ jobs:
           }
 
           if ($killed) {
-            Write-Error "HIP SDK 安装卡死，已强制终止。"
+            Write-Error "HIP SDK 安装卡死，已强制终止。建议改用本地编译或自托管 Runner。"
             exit 1
           }
 
           $exitCode = $proc.ExitCode
           Write-Host "安装进程退出码: $exitCode"
 
-          # 退出码不为 0 时，进一步检查是否真的失败
           if ($exitCode -ne 0) {
-            Write-Warning "安装程序返回非零退出码: $exitCode，检查关键文件是否存在..."
+            Write-Warning "安装程序返回非零退出码: $exitCode，继续检查关键文件是否存在..."
           }
 
           # 验证安装结果：检查关键目录和文件
@@ -117,14 +144,20 @@ jobs:
 
           Write-Host "✅ HIP SDK 安装验证通过。"
 
+      # ============================================================
+      # 4. 设置 HIP 环境变量
+      # ============================================================
       - name: 设置 HIP 环境变量
         shell: powershell
         run: |
           $hipPath = "C:\Program Files\AMD\ROCm\7.1"
           echo "HIP_PATH=$hipPath" >> $env:GITHUB_ENV
           echo "$hipPath\bin" >> $env:GITHUB_PATH
+          Write-Host "HIP_PATH 已设置为: $hipPath"
 
-      # ========== 3. 克隆 sudoingX/llama.cpp 的 bonsai2 分支 ==========
+      # ============================================================
+      # 5. 克隆 sudoingX/llama.cpp 的 bonsai2 分支
+      # ============================================================
       - name: 克隆 bonsai2 分支
         shell: bash
         run: |
@@ -132,7 +165,9 @@ jobs:
           cd llama.cpp
           git log -1 --oneline
 
-      # ========== 4. 记录 commit hash 用于版本标识 ==========
+      # ============================================================
+      # 6. 记录 commit hash 用于版本标识
+      # ============================================================
       - name: 获取 commit hash
         id: get_commit
         shell: bash
@@ -142,7 +177,29 @@ jobs:
           echo "COMMIT_HASH=$HASH" >> $GITHUB_OUTPUT
           echo "当前 commit: $HASH"
 
-      # ========== 5. 配置 CMake ==========
+      # ============================================================
+      # 7. 应用 Windows 编译补丁（如遇编译错误可启用）
+      # ============================================================
+      - name: 应用 Windows 编译补丁
+        shell: bash
+        run: |
+          cd llama.cpp
+          # 修复 min/max 命名冲突（如果 hip.h 存在且未包含 algorithm）
+          HIP_HEADER="ggml-cuda/vendors/hip.h"
+          if [ -f "$HIP_HEADER" ]; then
+            if ! grep -q "#include <algorithm>" "$HIP_HEADER"; then
+              echo "为 $HIP_HEADER 添加 algorithm 头文件与 using 声明"
+              sed -i '1i #include <algorithm>\nusing std::min; using std::max;' "$HIP_HEADER"
+            else
+              echo "$HIP_HEADER 已包含 algorithm 头文件，跳过"
+            fi
+          else
+            echo "未找到 $HIP_HEADER，跳过该补丁"
+          fi
+
+      # ============================================================
+      # 8. 配置 CMake
+      # ============================================================
       - name: 配置 CMake
         shell: powershell
         run: |
@@ -158,30 +215,47 @@ jobs:
             -DLLAMA_BUILD_EXAMPLES=OFF `
             -DLLAMA_BUILD_TESTS=OFF
 
-      # ========== 6. 编译 ==========
+      # ============================================================
+      # 9. 编译
+      # ============================================================
       - name: 编译
         shell: powershell
+        timeout-minutes: 60
         run: |
           cd llama.cpp
           cmake --build build --target llama-server llama-cli -j $env:NUMBER_OF_PROCESSORS
 
-      # ========== 7. 收集产物 ==========
+          Write-Host "=== 编译完成，产物列表 ==="
+          Get-ChildItem build\bin\ | Format-Table Name, Length
+
+      # ============================================================
+      # 10. 收集产物
+      # ============================================================
       - name: 收集产物
         shell: powershell
         run: |
           $hash = "${{ steps.get_commit.outputs.COMMIT_HASH }}"
           $date = Get-Date -Format 'yyyyMMdd'
           mkdir output
+
           copy llama.cpp\build\bin\llama-server.exe output\
           copy llama.cpp\build\bin\llama-cli.exe output\
 
-          # 复制 HIP SDK 关键 DLL，确保在未安装 HIP SDK 的机器上也能运行
+          # 复制 HIP SDK 关键 DLL
           $hipBin = "C:\Program Files\AMD\ROCm\7.1\bin"
-          @("amdhip64.dll", "rocblas.dll", "hipblas.dll", "rocsolver.dll",
+          $dlls = @(
+            "amdhip64.dll", "rocblas.dll", "hipblas.dll", "rocsolver.dll",
             "rocsparse.dll", "hipfft.dll", "rccl.dll", "hiprand.dll",
-            "rocrand.dll", "hipcub.dll", "roctracer64.dll") | ForEach-Object {
-            $src = Join-Path $hipBin $_
-            if (Test-Path $src) { copy $src output\ }
+            "rocrand.dll", "hipcub.dll", "roctracer64.dll"
+          )
+          foreach ($dll in $dlls) {
+            $src = Join-Path $hipBin $dll
+            if (Test-Path $src) {
+              copy $src output\
+              Write-Host "✅ 复制 $dll"
+            } else {
+              Write-Host "⚠️ 跳过不存在的 $dll"
+            }
           }
 
           # 写入构建信息
@@ -195,7 +269,12 @@ jobs:
 
           Compress-Archive -Path output\* -DestinationPath "bonsai2-win-gfx1030-$hash-$date.zip"
 
-      # ========== 8. 上传产物 ==========
+          Write-Host "=== 打包完成 ==="
+          Get-ChildItem *.zip | Format-Table Name, Length
+
+      # ============================================================
+      # 11. 上传产物
+      # ============================================================
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
@@ -203,7 +282,9 @@ jobs:
           path: bonsai2-win-gfx1030-*.zip
           retention-days: 30
 
-      # ========== 9. 创建 Release（可选） ==========
+      # ============================================================
+      # 12. 创建 Release（可选）
+      # ============================================================
       - name: 创建 Release
         if: github.event.inputs.create_release == 'true'
         uses: softprops/action-gh-release@v2
@@ -212,9 +293,16 @@ jobs:
           name: "Bonsai2 MTP Windows gfx1030 - ${{ steps.get_commit.outputs.COMMIT_HASH }}"
           body: |
             基于 `sudoingX/llama.cpp` 的 `bonsai2` 分支构建。
-            - Commit: `${{ steps.get_commit.outputs.COMMIT_HASH }}`
-            - 目标架构: gfx1030 (RX 6800 XT)
-            - 特性: PQ2_0 解析 + MTP Hadamard 修复 + PTQ1_0 MMV 内核
-            - 构建时间: ${{ github.run_id }}
-          files: bonsai2-win-gfx1030-*.zip
-          generate_release_notes: false
+
+            - **Commit**: `${{ steps.get_commit.outputs.COMMIT_HASH }}`
+            - **目标架构**: gfx1030 (RX 6800 XT)
+            - **特性**: PQ2_0 解析 + MTP Hadamard 修复 + PTQ1_0 MMV 内核
+            - **构建时间**: ${{ github.run_id }}
+
+            ### 运行示例
+            ```powershell
+            .\llama-server.exe -m "D:\ai-soft\AI-model\Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0.gguf" `
+              --mmproj "D:\ai-soft\AI-model\Ternary-Bonsai-27B-mmproj-Q8_0.gguf" `
+              -ngl 99 -c 65536 -fa on -ctk q8_0 -ctv q8_0 `
+              --load-mode none -np 1 --jinja `
+              --spec-type draft-mtp --spec-draft-n-max 1 --port 8080
