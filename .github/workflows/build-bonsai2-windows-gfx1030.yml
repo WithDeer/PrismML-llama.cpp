@@ -276,9 +276,6 @@ jobs:
           path: release/*.zip
           retention-days: 30
 
-      # ============================================================
-      # 用 gh CLI 创建 Release（单行 if 条件，无独立检查步骤）
-      # ============================================================
       - name: Create Release with gh CLI
         if: github.event_name != 'workflow_dispatch' || github.event.inputs.create_release == 'true'
         shell: bash
@@ -287,11 +284,12 @@ jobs:
         run: |
           set -e
           TAG="bonsai2-win-gfx1030-${{ steps.get_commit.outputs.COMMIT_HASH }}"
+          REPO="${{ github.repository }}"
           echo "=== event_name: ${{ github.event_name }} ==="
           echo "=== Target tag: $TAG ==="
+          echo "=== Target repo: $REPO ==="
 
-          # 用 gh CLI 检查是否已存在
-          if gh release view "$TAG" >/dev/null 2>&1; then
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             echo "Release $TAG already exists, skipping."
             exit 0
           fi
@@ -300,6 +298,7 @@ jobs:
           ls -la release/
 
           gh release create "$TAG" \
+            --repo "$REPO" \
             --title "Bonsai2 MTP Windows gfx1030 - ${{ steps.get_commit.outputs.COMMIT_HASH }}" \
             --notes "Built from [sudoingX/llama.cpp](https://github.com/sudoingX/llama.cpp) bonsai2 branch.
 
@@ -309,4 +308,4 @@ jobs:
             release/*.zip
 
           echo "=== Release created successfully ==="
-          gh release view "$TAG"
+          gh release view "$TAG" --repo "$REPO"
