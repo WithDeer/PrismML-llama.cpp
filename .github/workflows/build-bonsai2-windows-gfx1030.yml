@@ -42,7 +42,7 @@ jobs:
         id: cache-hip
         with:
           path: C:\Program Files\AMD\ROCm
-          key: hip-sdk-7.2-${{ runner.os }}-v1
+          key: hip-sdk-7.2-${{ runner.os }}-v2
           restore-keys: |
             hip-sdk-7.2-${{ runner.os }}-
 
@@ -83,7 +83,7 @@ jobs:
           Write-Host "Installation process exited."
           if (Test-Path $logFile) { Get-Content $logFile -Tail 20 }
 
-          # 自动检测实际安装的 ROCm 版本目录
+          # Auto-detect actual ROCm version directory
           $rocmBase = "C:\Program Files\AMD\ROCm"
           $hipPath = Get-ChildItem $rocmBase -Directory -ErrorAction SilentlyContinue |
                      Sort-Object Name -Descending | Select-Object -First 1
@@ -94,7 +94,7 @@ jobs:
           $hipPath = $hipPath.FullName
           Write-Host "Detected HIP SDK path: $hipPath"
 
-          # 递归搜索关键文件，不假设固定位置
+          # Recursively search for key files
           $clang = Get-ChildItem -Path $hipPath -Recurse -Filter "clang.exe" -ErrorAction SilentlyContinue |
                    Select-Object -First 1
           $amdhip = Get-ChildItem -Path $hipPath -Recurse -Filter "amdhip64*.dll" -ErrorAction SilentlyContinue |
@@ -103,10 +103,6 @@ jobs:
           if (-not $clang) { Write-Error "clang.exe not found"; exit 1 }
           if (-not $amdhip) {
             Write-Error "amdhip64*.dll not found in $hipPath"
-            Write-Host "=== Listing top-level directories ==="
-            Get-ChildItem $hipPath -Directory | Select-Object FullName | Format-Table
-            Write-Host "=== Listing bin directory ==="
-            Get-ChildItem "$hipPath\bin" -ErrorAction SilentlyContinue | Select-Object Name | Format-Table
             exit 1
           }
 
@@ -139,7 +135,59 @@ jobs:
           Write-Host "HIP_BIN  = $env:HIP_BIN"
 
       # ============================================================
-      # 6. Clone bonsai2 branch
+      # 6. FIX: Adjust clang HIP runtime wrapper header order
+      # ============================================================
+      - name: Fix clang HIP header order
+        shell: powershell
+        run: |
+          $hipPath = $env:HIP_PATH
+          Write-Host "HIP_PATH = $hipPath"
+
+          # Find __clang_hip_runtime_wrapper.h (under lib\clang\<version>\include)
+          $wrapper = Get-ChildItem -Path $hipPath -Recurse -Filter "__clang_hip_runtime_wrapper.h" -ErrorAction SilentlyContinue |
+                     Select-Object -First 1
+          if (-not $wrapper) {
+            Write-Error "__clang_hip_runtime_wrapper.h not found under $hipPath"
+            exit 1
+          }
+          $wrapperPath = $wrapper.FullName
+          Write-Host "Found wrapper: $wrapperPath"
+
+          # Backup
+          Copy-Item $wrapperPath "$wrapperPath.bak" -Force
+
+          # Read content
+          $content = Get-Content $wrapperPath -Raw
+
+          # Move the math forward declares include before <cmath>
+          # The file currently includes __clang_cuda_math_forward_declares.h after <cmath>
+          # We'll insert it before the first #include <cmath> line
+          $target = "#include <cmath>"
+          if ($content -match [regex]::Escape($target)) {
+            # Insert the forward declares before <cmath>
+            $insertLine = "#include <__clang_cuda_math_forward_declares.h>"
+            # Avoid duplicate if already inserted
+            if ($content -notmatch [regex]::Escape($insertLine)) {
+              $content = $content -replace [regex]::Escape($target), "$insertLine`n$target"
+              Set-Content -Path $wrapperPath -Value $content -Encoding UTF8
+              Write-Host "Inserted __clang_cuda_math_forward_declares.h before <cmath>"
+            } else {
+              Write-Host "Forward declares already present before <cmath>, skipping."
+            }
+          } else {
+            Write-Warning "<cmath> include not found in wrapper; manual fix may be needed."
+          }
+
+          # Verify
+          $verify = Get-Content $wrapperPath -Raw
+          if ($verify -match [regex]::Escape("#include <__clang_cuda_math_forward_declares.h>")) {
+            Write-Host "Verification: forward declares header is present."
+          } else {
+            Write-Warning "Verification: forward declares header NOT found."
+          }
+
+      # ============================================================
+      # 7. Clone bonsai2 branch
       # ============================================================
       - name: Clone bonsai2 branch
         shell: bash
@@ -149,7 +197,7 @@ jobs:
           git log -1 --oneline
 
       # ============================================================
-      # 7. Get commit hash
+      # 8. Get commit hash
       # ============================================================
       - name: Get commit hash
         id: get_commit
@@ -161,7 +209,7 @@ jobs:
           echo "Current commit: $HASH"
 
       # ============================================================
-      # 8. Apply Windows compile patch
+      # 9. Apply Windows compile patch
       # ============================================================
       - name: Apply Windows compile patch
         shell: bash
@@ -176,7 +224,7 @@ jobs:
           fi
 
       # ============================================================
-      # 9. Configure CMake
+      # 10. Configure CMake
       # ============================================================
       - name: Configure CMake
         shell: powershell
@@ -198,7 +246,7 @@ jobs:
             -DLLAMA_BUILD_TESTS=OFF
 
       # ============================================================
-      # 10. Build
+      # 11. Build
       # ============================================================
       - name: Build
         shell: powershell
@@ -211,7 +259,7 @@ jobs:
           Get-ChildItem build\bin\ | Format-Table Name, Length
 
       # ============================================================
-      # 11. Collect artifacts
+      # 12. Collect artifacts
       # ============================================================
       - name: Collect artifacts
         shell: powershell
@@ -224,7 +272,7 @@ jobs:
           copy llama.cpp\build\bin\llama-server.exe output\
           copy llama.cpp\build\bin\llama-cli.exe output\
 
-          # 递归搜索并复制关键 ROCm DLL
+          # Recursively search and copy key ROCm DLLs
           $dllNames = @(
             "amdhip64*.dll", "rocblas*.dll", "hipblas*.dll", "rocsolver*.dll",
             "rocsparse*.dll", "hipfft*.dll", "rccl*.dll", "hiprand*.dll",
@@ -256,7 +304,7 @@ jobs:
           Get-ChildItem *.zip | Format-Table Name, Length
 
       # ============================================================
-      # 12. Upload artifacts
+      # 13. Upload artifacts
       # ============================================================
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -266,7 +314,7 @@ jobs:
           retention-days: 30
 
       # ============================================================
-      # 13. Create Release (optional)
+      # 14. Create Release (optional)
       # ============================================================
       - name: Create Release
         if: github.event.inputs.create_release == 'true'
