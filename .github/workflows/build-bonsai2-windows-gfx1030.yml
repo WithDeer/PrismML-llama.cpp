@@ -90,25 +90,17 @@ jobs:
           }
           Write-Host "HIP_PATH = $env:HIP_PATH"
 
-      # ============================================================
-      # Patch clang HIP math headers (v3)
-      # 1. 注释 __clang_cuda_math_forward_declares.h（避免 __device__ 纯声明冲突）
-      # 2. 注释 __clang_hip_cmath.h 中 7 个与 MSVC 冲突的函数
-      # 3. 把 __clang_cuda_complex_builtins.h 中的 std::* 改为 __builtin_*
-      # ============================================================
       - name: Patch clang HIP math headers
         shell: powershell
         run: |
           $hipPath = $env:HIP_PATH
-
           $wrapper = Get-ChildItem -Path $hipPath -Recurse -Filter "__clang_hip_runtime_wrapper.h" -ErrorAction SilentlyContinue |
                      Select-Object -First 1
           if (-not $wrapper) { Write-Error "wrapper not found"; exit 1 }
           $headerDir = $wrapper.Directory.FullName
           $wrapperPath = $wrapper.FullName
-          Write-Host "Header dir: $headerDir"
 
-          # === Patch 1: wrapper ===
+          # Patch 1: wrapper
           $content = Get-Content $wrapperPath -Raw
           if ($content -notmatch "PATCHED_V3") {
             Copy-Item $wrapperPath "$wrapperPath.bak" -Force
@@ -117,15 +109,12 @@ jobs:
             foreach ($line in $lines) {
               if ($line -match '^\s*#include\s*<__clang_cuda_math_forward_declares\.h>') {
                 $newLines += "// PATCHED_V3: $line"
-              } else {
-                $newLines += $line
-              }
+              } else { $newLines += $line }
             }
             $newLines | Set-Content -Path $wrapperPath -Encoding UTF8
-            Write-Host "Patched wrapper"
           }
 
-          # === Patch 2: __clang_hip_cmath.h ===
+          # Patch 2: __clang_hip_cmath.h
           $cmathHeader = Join-Path $headerDir "__clang_hip_cmath.h"
           if (Test-Path $cmathHeader) {
             $content = Get-Content $cmathHeader -Raw
@@ -136,7 +125,6 @@ jobs:
               $conflicting = @('isgreater', 'isgreaterequal', 'isless', 'islessequal', 'islessgreater', 'isunordered', 'signbit')
               $skipBlock = $false
               $braceDepth = 0
-
               foreach ($line in $lines) {
                 if ($skipBlock) {
                   $newLines += "// PATCHED_V3: $line"
@@ -146,32 +134,23 @@ jobs:
                   if ($braceDepth -le 0) { $skipBlock = $false; $braceDepth = 0 }
                   continue
                 }
-
                 $matched = $false
                 foreach ($fn in $conflicting) {
-                  if ($line -match "^\s*__DEVICE__\s+__CONSTEXPR__\s+bool\s+$fn\s*\(") {
-                    $matched = $true
-                    break
-                  }
+                  if ($line -match "^\s*__DEVICE__\s+__CONSTEXPR__\s+bool\s+$fn\s*\(") { $matched = $true; break }
                 }
-
                 if ($matched) {
                   $newLines += "// PATCHED_V3: $line"
                   $open = ([regex]::Matches($line, '\{')).Count
                   $close = ([regex]::Matches($line, '\}')).Count
                   $braceDepth = $open - $close
                   if ($braceDepth -gt 0) { $skipBlock = $true }
-                } else {
-                  $newLines += $line
-                }
+                } else { $newLines += $line }
               }
-
               $newLines | Set-Content -Path $cmathHeader -Encoding UTF8
-              Write-Host "Patched __clang_hip_cmath.h"
             }
           }
 
-          # === Patch 3: __clang_cuda_complex_builtins.h ===
+          # Patch 3: __clang_cuda_complex_builtins.h
           $complexHeader = Join-Path $headerDir "__clang_cuda_complex_builtins.h"
           if (Test-Path $complexHeader) {
             $content = Get-Content $complexHeader -Raw
@@ -183,15 +162,9 @@ jobs:
               $content = $content -replace '#define _ABSd std::abs', '#define _ABSd __builtin_fabs // PATCHED_V3'
               $content = $content -replace '#define _ABSf std::abs', '#define _ABSf __builtin_fabsf // PATCHED_V3'
               Set-Content -Path $complexHeader -Value $content -Encoding UTF8
-              Write-Host "Patched __clang_cuda_complex_builtins.h"
             }
           }
-
-          # Verify
-          $v1 = (Get-Content $wrapperPath -Raw) -notmatch '^\s*#include\s*<__clang_cuda_math_forward_declares\.h>' -or $true
-          $v2 = (Get-Content $cmathHeader -Raw) -match 'PATCHED_V3'
-          $v3 = (Get-Content $complexHeader -Raw) -match '__builtin_isnan'
-          Write-Host "Verification: wrapper_ok=$true cmath_patched=$v2 complex_patched=$v3"
+          Write-Host "Header patches applied."
 
       - name: Clone bonsai2 branch
         shell: bash
@@ -247,8 +220,12 @@ jobs:
           cd llama.cpp
           $env:PATH = "$($env:HIP_BIN);$env:PATH"
           cmake --build build --target llama-server llama-cli -j $env:NUMBER_OF_PROCESSORS
+          Write-Host "=== build\bin contents ==="
           Get-ChildItem build\bin\ | Format-Table Name, Length
 
+      # ============================================================
+      # 关键修复：完整打包所有 EXE + DLL
+      # ============================================================
       - name: Collect artifacts
         shell: powershell
         run: |
@@ -257,29 +234,60 @@ jobs:
           $hipPath = $env:HIP_PATH
           mkdir output
 
-          copy llama.cpp\build\bin\llama-server.exe output\
-          copy llama.cpp\build\bin\llama-cli.exe output\
+          # 1) 复制 build/bin 下的所有 exe 和 dll（llama.cpp 自身的运行时）
+          Write-Host "=== Copying build/bin/* ==="
+          Copy-Item llama.cpp\build\bin\*.exe output\ -ErrorAction SilentlyContinue
+          Copy-Item llama.cpp\build\bin\*.dll output\ -ErrorAction SilentlyContinue
 
-          $dllNames = @(
-            "amdhip64*.dll", "rocblas*.dll", "hipblas*.dll", "rocsolver*.dll",
-            "rocsparse*.dll", "hipfft*.dll", "rccl*.dll", "hiprand*.dll",
-            "rocrand*.dll", "hipcub*.dll", "roctracer64*.dll"
-          )
-          foreach ($pattern in $dllNames) {
-            $found = Get-ChildItem -Path $hipPath -Recurse -Filter $pattern -ErrorAction SilentlyContinue |
-                     Select-Object -First 1
-            if ($found) { copy $found.FullName output\ }
+          # 2) 复制 ROCm 运行时 DLL（常见清单）
+          Write-Host "=== Copying ROCm runtime DLLs ==="
+          $hipBinDirs = @(
+            (Join-Path $hipPath "bin"),
+            (Join-Path $env:HIP_BIN "")
+          ) | Where-Object { Test-Path $_ } | Select-Object -Unique
+
+          # 直接复制整个 HIP bin 目录下的所有 DLL（更稳妥）
+          foreach ($binDir in $hipBinDirs) {
+            Write-Host "Searching DLLs in: $binDir"
+            Get-ChildItem -Path $binDir -Filter "*.dll" -ErrorAction SilentlyContinue |
+              ForEach-Object {
+                Copy-Item $_.FullName output\ -Force -ErrorAction SilentlyContinue
+              }
           }
 
+          # 3) 额外递归查找某些核心 DLL（可能不在 bin 下）
+          $extraPatterns = @(
+            "amdhip64*.dll", "rocblas*.dll", "hipblas*.dll", "rocsolver*.dll",
+            "rocsparse*.dll", "hipfft*.dll", "rccl*.dll", "hiprand*.dll",
+            "rocrand*.dll", "hipcub*.dll", "roctracer64*.dll",
+            "amd_comgr*.dll", "rocm-core*.dll", "hsa-runtime64*.dll",
+            "llvm*.dll", "clang*.dll"
+          )
+          foreach ($pattern in $extraPatterns) {
+            Get-ChildItem -Path $hipPath -Recurse -Filter $pattern -ErrorAction SilentlyContinue |
+              ForEach-Object {
+                Copy-Item $_.FullName output\ -Force -ErrorAction SilentlyContinue
+              }
+          }
+
+          # 4) 写入构建信息
           @"
           Branch: bonsai2 (sudoingX/llama.cpp)
           Commit: $hash
           Build Date: $date
           Target GPU: gfx1030 (RX 6800 XT)
+          HIP SDK Path: $hipPath
           Features: PQ2_0 support + MTP Hadamard fix + PTQ1_0 MMV kernel
           "@ | Out-File output\BUILD_INFO.txt -Encoding UTF8
 
-          Compress-Archive -Path output\* -DestinationPath "bonsai2-win-gfx1030-$hash-$date.zip"
+          # 5) 显示打包内容
+          Write-Host "=== Files in output ==="
+          Get-ChildItem output\ | Sort-Object Name | Format-Table Name, Length
+
+          # 6) 打包
+          Compress-Archive -Path output\* -DestinationPath "bonsai2-win-gfx1030-$hash-$date.zip" -Force
+          Write-Host "=== Final zip ==="
+          Get-ChildItem *.zip | Format-Table Name, Length
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
