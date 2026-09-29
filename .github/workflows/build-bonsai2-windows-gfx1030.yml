@@ -36,7 +36,7 @@ jobs:
         shell: powershell
         run: |
           # 请替换为 AMD 官网当前最新的 HIP SDK for Windows 下载地址
-          $url = "https://download.amd.com/developer/eula/rocm-hub/AMD-Software-PRO-Edition-24.Q3-WinSvr2022-For-HIP.exe"
+          $url = "https://www.amd.com/zh-cn/developer/resources/rocm-hub/eula/licenses.html?filename=AMD-Software-PRO-Edition-26.Q3-Win11-For-HIP.exe"
           Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\HIP-SDK.exe" -UseBasicParsing
 
       - name: 安装 HIP SDK
