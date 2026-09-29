@@ -100,7 +100,6 @@ jobs:
           $headerDir = $wrapper.Directory.FullName
           $wrapperPath = $wrapper.FullName
 
-          # Patch 1: wrapper
           $content = Get-Content $wrapperPath -Raw
           if ($content -notmatch "PATCHED_V3") {
             Copy-Item $wrapperPath "$wrapperPath.bak" -Force
@@ -114,7 +113,6 @@ jobs:
             $newLines | Set-Content -Path $wrapperPath -Encoding UTF8
           }
 
-          # Patch 2: __clang_hip_cmath.h
           $cmathHeader = Join-Path $headerDir "__clang_hip_cmath.h"
           if (Test-Path $cmathHeader) {
             $content = Get-Content $cmathHeader -Raw
@@ -150,7 +148,6 @@ jobs:
             }
           }
 
-          # Patch 3: __clang_cuda_complex_builtins.h
           $complexHeader = Join-Path $headerDir "__clang_cuda_complex_builtins.h"
           if (Test-Path $complexHeader) {
             $content = Get-Content $complexHeader -Raw
@@ -223,9 +220,6 @@ jobs:
           Write-Host "=== build\bin contents ==="
           Get-ChildItem build\bin\ | Format-Table Name, Length
 
-      # ============================================================
-      # 关键修复：完整打包所有 EXE + DLL
-      # ============================================================
       - name: Collect artifacts
         shell: powershell
         run: |
@@ -234,28 +228,21 @@ jobs:
           $hipPath = $env:HIP_PATH
           mkdir output
 
-          # 1) 复制 build/bin 下的所有 exe 和 dll（llama.cpp 自身的运行时）
-          Write-Host "=== Copying build/bin/* ==="
+          # llama.cpp 自身的运行时（exe + dll）
           Copy-Item llama.cpp\build\bin\*.exe output\ -ErrorAction SilentlyContinue
           Copy-Item llama.cpp\build\bin\*.dll output\ -ErrorAction SilentlyContinue
 
-          # 2) 复制 ROCm 运行时 DLL（常见清单）
-          Write-Host "=== Copying ROCm runtime DLLs ==="
+          # ROCm 运行时 DLL
           $hipBinDirs = @(
             (Join-Path $hipPath "bin"),
             (Join-Path $env:HIP_BIN "")
           ) | Where-Object { Test-Path $_ } | Select-Object -Unique
 
-          # 直接复制整个 HIP bin 目录下的所有 DLL（更稳妥）
           foreach ($binDir in $hipBinDirs) {
-            Write-Host "Searching DLLs in: $binDir"
             Get-ChildItem -Path $binDir -Filter "*.dll" -ErrorAction SilentlyContinue |
-              ForEach-Object {
-                Copy-Item $_.FullName output\ -Force -ErrorAction SilentlyContinue
-              }
+              ForEach-Object { Copy-Item $_.FullName output\ -Force -ErrorAction SilentlyContinue }
           }
 
-          # 3) 额外递归查找某些核心 DLL（可能不在 bin 下）
           $extraPatterns = @(
             "amdhip64*.dll", "rocblas*.dll", "hipblas*.dll", "rocsolver*.dll",
             "rocsparse*.dll", "hipfft*.dll", "rccl*.dll", "hiprand*.dll",
@@ -265,12 +252,9 @@ jobs:
           )
           foreach ($pattern in $extraPatterns) {
             Get-ChildItem -Path $hipPath -Recurse -Filter $pattern -ErrorAction SilentlyContinue |
-              ForEach-Object {
-                Copy-Item $_.FullName output\ -Force -ErrorAction SilentlyContinue
-              }
+              ForEach-Object { Copy-Item $_.FullName output\ -Force -ErrorAction SilentlyContinue }
           }
 
-          # 4) 写入构建信息
           @"
           Branch: bonsai2 (sudoingX/llama.cpp)
           Commit: $hash
@@ -280,11 +264,9 @@ jobs:
           Features: PQ2_0 support + MTP Hadamard fix + PTQ1_0 MMV kernel
           "@ | Out-File output\BUILD_INFO.txt -Encoding UTF8
 
-          # 5) 显示打包内容
           Write-Host "=== Files in output ==="
           Get-ChildItem output\ | Sort-Object Name | Format-Table Name, Length
 
-          # 6) 打包
           Compress-Archive -Path output\* -DestinationPath "bonsai2-win-gfx1030-$hash-$date.zip" -Force
           Write-Host "=== Final zip ==="
           Get-ChildItem *.zip | Format-Table Name, Length
@@ -296,15 +278,70 @@ jobs:
           path: bonsai2-win-gfx1030-*.zip
           retention-days: 30
 
+      # ============================================================
+      # 新增：检查该 commit 是否已发布过 release
+      # ============================================================
+      - name: Check if release exists
+        id: check_release
+        shell: powershell
+        run: |
+          $tag = "bonsai2-win-gfx1030-${{ steps.get_commit.outputs.COMMIT_HASH }}"
+          $headers = @{
+            "Authorization" = "token ${{ secrets.GITHUB_TOKEN }}"
+            "Accept" = "application/vnd.github+json"
+            "User-Agent" = "GitHub-Action"
+          }
+          try {
+            $resp = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/releases/tags/$tag" -Headers $headers -ErrorAction Stop
+            Write-Host "Release already exists: $tag"
+            echo "EXISTS=true" >> $env:GITHUB_OUTPUT
+          } catch {
+            Write-Host "Release not found, will create: $tag"
+            echo "EXISTS=false" >> $env:GITHUB_OUTPUT
+          }
+
+      # ============================================================
+      # 新增：推送构建物到 GitHub Release
+      # 触发条件：
+      #   - 手动触发且用户选择 create_release=true
+      #   - 或 push 到 main / 定时触发（自动 release）
+      # 且该 commit 尚未 release 过
+      # ============================================================
       - name: Create Release
-        if: github.event.inputs.create_release == 'true'
+        if: |
+          steps.check_release.outputs.EXISTS == 'false' && (
+            (github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true') ||
+            (github.event_name != 'workflow_dispatch')
+          )
         uses: softprops/action-gh-release@v2
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           tag_name: bonsai2-win-gfx1030-${{ steps.get_commit.outputs.COMMIT_HASH }}
           name: "Bonsai2 MTP Windows gfx1030 - ${{ steps.get_commit.outputs.COMMIT_HASH }}"
-          body: |
-            Built from `sudoingX/llama.cpp` bonsai2 branch.
-            - Commit: `${{ steps.get_commit.outputs.COMMIT_HASH }}`
-            - Target GPU: gfx1030 (RX 6800 XT)
-          files: bonsai2-win-gfx1030-*.zip
+          draft: false
+          prerelease: false
+          make_latest: true
           generate_release_notes: false
+          body: |
+            ## Bonsai2 MTP Windows Build for RX 6800 XT
+
+            基于 [`sudoingX/llama.cpp`](https://github.com/sudoingX/llama.cpp) 的 `bonsai2` 分支构建。
+
+            ### 构建信息
+            - **Commit**: `${{ steps.get_commit.outputs.COMMIT_HASH }}`
+            - **目标 GPU**: gfx1030 (RX 6800 XT)
+            - **构建时间**: ${{ github.run_id }}
+            - **工作流**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            ### 特性
+            - PQ2_0 三元量化解析
+            - MTP Hadamard 修复（启用 `--spec-type draft-mtp`）
+            - PTQ1_0 MMV 内核优化
+
+            ### 快速开始
+            ```powershell
+            .\llama-server.exe -m "D:\path\to\Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0.gguf" `
+              --mmproj "D:\path\to\Ternary-Bonsai-27B-mmproj-Q8_0.gguf" `
+              -ngl 99 -c 65536 -fa on -ctk q8_0 -ctv q8_0 `
+              --load-mode none -np 1 --jinja `
+              --spec-type draft-mtp --spec-draft-n-max 1 --port 8080
