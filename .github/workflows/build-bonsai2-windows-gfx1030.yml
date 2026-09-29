@@ -1,0 +1,147 @@
+name: Build Bonsai2 MTP for Windows gfx1030
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: '是否创建 GitHub Release'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+  push:
+    branches: [ main ]
+  schedule:
+    # 每周一 UTC 02:00 自动检查 sudoingX/llama.cpp 更新
+    - cron: '0 2 * * 1'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      # ========== 1. 安装 Ninja ==========
+      - name: 安装 Ninja
+        run: |
+          choco install ninja -y
+          refreshenv
+
+      # ========== 2. 下载并安装 HIP SDK ==========
+      - name: 下载 HIP SDK
+        shell: powershell
+        run: |
+          # 请替换为 AMD 官网当前最新的 HIP SDK for Windows 下载地址
+          $url = "https://download.amd.com/developer/eula/rocm-hub/AMD-Software-PRO-Edition-24.Q3-WinSvr2022-For-HIP.exe"
+          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\HIP-SDK.exe" -UseBasicParsing
+
+      - name: 安装 HIP SDK
+        shell: powershell
+        run: |
+          Start-Process -FilePath "$env:TEMP\HIP-SDK.exe" -ArgumentList "/S" -Wait -NoNewWindow
+
+      - name: 设置 HIP 环境变量
+        shell: powershell
+        run: |
+          $hipPath = "C:\Program Files\AMD\ROCm\7.1"
+          echo "HIP_PATH=$hipPath" >> $env:GITHUB_ENV
+          echo "$hipPath\bin" >> $env:GITHUB_PATH
+
+      # ========== 3. 克隆 sudoingX/llama.cpp 的 bonsai2 分支 ==========
+      - name: 克隆 bonsai2 分支
+        shell: bash
+        run: |
+          git clone --depth 1 -b bonsai2 https://github.com/sudoingX/llama.cpp.git
+          cd llama.cpp
+          git log -1 --oneline
+
+      # ========== 4. 记录 commit hash 用于版本标识 ==========
+      - name: 获取 commit hash
+        id: get_commit
+        shell: bash
+        run: |
+          cd llama.cpp
+          HASH=$(git rev-parse --short HEAD)
+          echo "COMMIT_HASH=$HASH" >> $GITHUB_OUTPUT
+          echo "当前 commit: $HASH"
+
+      # ========== 5. 配置 CMake ==========
+      - name: 配置 CMake
+        shell: powershell
+        run: |
+          cd llama.cpp
+          cmake -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DGGML_HIP=ON `
+            -DAMDGPU_TARGETS=gfx1030 `
+            -DCMAKE_C_COMPILER=clang `
+            -DCMAKE_CXX_COMPILER=clang++ `
+            -DGGML_CUDA_BATCH_INVARIANT=ON `
+            -DLLAMA_BUILD_SERVER=ON `
+            -DLLAMA_BUILD_EXAMPLES=OFF `
+            -DLLAMA_BUILD_TESTS=OFF
+
+      # ========== 6. 编译 ==========
+      - name: 编译
+        shell: powershell
+        run: |
+          cd llama.cpp
+          cmake --build build --target llama-server llama-cli -j $env:NUMBER_OF_PROCESSORS
+
+      # ========== 7. 收集产物 ==========
+      - name: 收集产物
+        shell: powershell
+        run: |
+          $hash = "${{ steps.get_commit.outputs.COMMIT_HASH }}"
+          $date = Get-Date -Format 'yyyyMMdd'
+          mkdir output
+          copy llama.cpp\build\bin\llama-server.exe output\
+          copy llama.cpp\build\bin\llama-cli.exe output\
+
+          # 复制 HIP SDK 关键 DLL，确保在未安装 HIP SDK 的机器上也能运行
+          $hipBin = "C:\Program Files\AMD\ROCm\7.1\bin"
+          @("amdhip64.dll", "rocblas.dll", "hipblas.dll", "rocsolver.dll",
+            "rocsparse.dll", "hipfft.dll", "rccl.dll", "hiprand.dll",
+            "rocrand.dll", "hipcub.dll", "roctracer64.dll") | ForEach-Object {
+            $src = Join-Path $hipBin $_
+            if (Test-Path $src) { copy $src output\ }
+          }
+
+          # 写入构建信息
+          @"
+          Branch: bonsai2 (sudoingX/llama.cpp)
+          Commit: $hash
+          Build Date: $date
+          Target GPU: gfx1030 (RX 6800 XT)
+          Features: PQ2_0 support + MTP Hadamard fix + PTQ1_0 MMV kernel
+          "@ | Out-File output\BUILD_INFO.txt -Encoding UTF8
+
+          Compress-Archive -Path output\* -DestinationPath "bonsai2-win-gfx1030-$hash-$date.zip"
+
+      # ========== 8. 上传产物 ==========
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: bonsai2-win-gfx1030-${{ steps.get_commit.outputs.COMMIT_HASH }}
+          path: bonsai2-win-gfx1030-*.zip
+          retention-days: 30
+
+      # ========== 9. 创建 Release（可选） ==========
+      - name: 创建 Release
+        if: github.event.inputs.create_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: bonsai2-win-gfx1030-${{ steps.get_commit.outputs.COMMIT_HASH }}
+          name: "Bonsai2 MTP Windows gfx1030 - ${{ steps.get_commit.outputs.COMMIT_HASH }}"
+          body: |
+            基于 `sudoingX/llama.cpp` 的 `bonsai2` 分支构建。
+            - Commit: `${{ steps.get_commit.outputs.COMMIT_HASH }}`
+            - 目标架构: gfx1030 (RX 6800 XT)
+            - 特性: PQ2_0 解析 + MTP Hadamard 修复 + PTQ1_0 MMV 内核
+            - 构建时间: ${{ github.run_id }}
+          files: bonsai2-win-gfx1030-*.zip
+          generate_release_notes: false
