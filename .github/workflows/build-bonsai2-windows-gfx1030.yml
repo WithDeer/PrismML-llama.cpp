@@ -276,7 +276,10 @@ jobs:
           path: release/*.zip
           retention-days: 30
 
-      - name: Create Release with gh CLI
+      # ============================================================
+      # 创建 Release 或上传资产到已有 Release
+      # ============================================================
+      - name: Publish Release
         if: github.event_name != 'workflow_dispatch' || github.event.inputs.create_release == 'true'
         shell: bash
         env:
@@ -289,23 +292,27 @@ jobs:
           echo "=== Target tag: $TAG ==="
           echo "=== Target repo: $REPO ==="
 
-          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-            echo "Release $TAG already exists, skipping."
-            exit 0
-          fi
-
           echo "=== Files to upload ==="
           ls -la release/
 
-          gh release create "$TAG" \
-            --repo "$REPO" \
-            --title "Bonsai2 MTP Windows gfx1030 - ${{ steps.get_commit.outputs.COMMIT_HASH }}" \
-            --notes "Built from [sudoingX/llama.cpp](https://github.com/sudoingX/llama.cpp) bonsai2 branch.
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "=== Release $TAG already exists, uploading assets to it ==="
+            # 上传并覆盖同名资产
+            gh release upload "$TAG" release/*.zip --repo "$REPO" --clobber
+            echo "=== Assets uploaded to existing release ==="
+          else
+            echo "=== Creating new release $TAG ==="
+            gh release create "$TAG" \
+              --repo "$REPO" \
+              --title "Bonsai2 MTP Windows gfx1030 - ${{ steps.get_commit.outputs.COMMIT_HASH }}" \
+              --notes "Built from [sudoingX/llama.cpp](https://github.com/sudoingX/llama.cpp) bonsai2 branch.
 
           Commit: \`${{ steps.get_commit.outputs.COMMIT_HASH }}\`
           Target GPU: gfx1030 (RX 6800 XT)
           Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            release/*.zip
+              release/*.zip
+            echo "=== Release created successfully ==="
+          fi
 
-          echo "=== Release created successfully ==="
+          echo "=== Final release state ==="
           gh release view "$TAG" --repo "$REPO"
