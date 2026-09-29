@@ -42,9 +42,9 @@ jobs:
         id: cache-hip
         with:
           path: C:\Program Files\AMD\ROCm
-          key: hip-sdk-7.1-${{ runner.os }}-v1
+          key: hip-sdk-7.2-${{ runner.os }}-v1
           restore-keys: |
-            hip-sdk-7.1-${{ runner.os }}-
+            hip-sdk-7.2-${{ runner.os }}-
 
       # ============================================================
       # 3. Download HIP SDK (if not cached)
@@ -74,55 +74,69 @@ jobs:
           $logFile = "$env:TEMP\hip-install.log"
           Write-Host "Starting silent HIP SDK installation..."
           $proc = Start-Process -FilePath $installer -ArgumentList "-install", "-log", $logFile -NoNewWindow -PassThru
-          $completed = $proc.WaitForExit(1500000) # 25 minutes
+          $completed = $proc.WaitForExit(1500000)
           if (-not $completed) {
             Write-Error "HIP SDK installation timed out."
             $proc.Kill()
             exit 1
           }
           Write-Host "Installation process exited."
-          if (Test-Path $logFile) { Get-Content $logFile -Tail 30 }
+          if (Test-Path $logFile) { Get-Content $logFile -Tail 20 }
 
-          # Do NOT rely on $proc.ExitCode; verify actual files instead
-          $hipPath = "C:\Program Files\AMD\ROCm\7.1"
-          if (-not (Test-Path $hipPath)) {
-            Write-Host "Expected path $hipPath not found, searching for actual ROCm directory..."
-            $found = Get-ChildItem "C:\Program Files\AMD\ROCm" -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($found) { $hipPath = $found.FullName }
-          }
-
-          $requiredFiles = @(
-            "$hipPath\bin\amdhip64.dll",
-            "$hipPath\bin\clang.exe"
-          )
-          $missing = @()
-          foreach ($f in $requiredFiles) {
-            if (Test-Path $f) {
-              Write-Host "OK: $f"
-            } else {
-              Write-Host "MISSING: $f"
-              $missing += $f
-            }
-          }
-          if ($missing.Count -gt 0) {
-            Write-Error "HIP SDK installation incomplete. Missing: $($missing -join ', ')"
+          # 自动检测实际安装的 ROCm 版本目录
+          $rocmBase = "C:\Program Files\AMD\ROCm"
+          $hipPath = Get-ChildItem $rocmBase -Directory -ErrorAction SilentlyContinue |
+                     Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $hipPath) {
+            Write-Error "No ROCm directory found under $rocmBase"
             exit 1
           }
-          Write-Host "HIP SDK installation verified."
+          $hipPath = $hipPath.FullName
+          Write-Host "Detected HIP SDK path: $hipPath"
+
+          # 递归搜索关键文件，不假设固定位置
+          $clang = Get-ChildItem -Path $hipPath -Recurse -Filter "clang.exe" -ErrorAction SilentlyContinue |
+                   Select-Object -First 1
+          $amdhip = Get-ChildItem -Path $hipPath -Recurse -Filter "amdhip64*.dll" -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+
+          if (-not $clang) { Write-Error "clang.exe not found"; exit 1 }
+          if (-not $amdhip) {
+            Write-Error "amdhip64*.dll not found in $hipPath"
+            Write-Host "=== Listing top-level directories ==="
+            Get-ChildItem $hipPath -Directory | Select-Object FullName | Format-Table
+            Write-Host "=== Listing bin directory ==="
+            Get-ChildItem "$hipPath\bin" -ErrorAction SilentlyContinue | Select-Object Name | Format-Table
+            exit 1
+          }
+
+          Write-Host "clang.exe: $($clang.FullName)"
+          Write-Host "amdhip64:  $($amdhip.FullName)"
+
+          echo "HIP_PATH=$hipPath" >> $env:GITHUB_ENV
+          echo "HIP_BIN=$($clang.Directory.FullName)" >> $env:GITHUB_ENV
+          echo "$($clang.Directory.FullName)" >> $env:GITHUB_PATH
 
       # ============================================================
-      # 5. Set HIP Environment Variables
+      # 5. Set HIP Environment Variables (also for cached case)
       # ============================================================
       - name: Set HIP Environment
         shell: powershell
         run: |
-          $hipPath = "C:\Program Files\AMD\ROCm\7.1"
-          if (-not (Test-Path $hipPath)) {
-            $hipPath = (Get-ChildItem "C:\Program Files\AMD\ROCm" -Directory | Select-Object -First 1).FullName
+          if (-not $env:HIP_PATH) {
+            $rocmBase = "C:\Program Files\AMD\ROCm"
+            $hipPath = Get-ChildItem $rocmBase -Directory -ErrorAction SilentlyContinue |
+                       Sort-Object Name -Descending | Select-Object -First 1
+            $hipPath = $hipPath.FullName
+            $clang = Get-ChildItem -Path $hipPath -Recurse -Filter "clang.exe" -ErrorAction SilentlyContinue |
+                     Select-Object -First 1
+            $hipBin = $clang.Directory.FullName
+            echo "HIP_PATH=$hipPath" >> $env:GITHUB_ENV
+            echo "HIP_BIN=$hipBin" >> $env:GITHUB_ENV
+            echo "$hipBin" >> $env:GITHUB_PATH
           }
-          echo "HIP_PATH=$hipPath" >> $env:GITHUB_ENV
-          echo "$hipPath\bin" >> $env:GITHUB_PATH
-          Write-Host "HIP_PATH set to: $hipPath"
+          Write-Host "HIP_PATH = $env:HIP_PATH"
+          Write-Host "HIP_BIN  = $env:HIP_BIN"
 
       # ============================================================
       # 6. Clone bonsai2 branch
@@ -169,13 +183,15 @@ jobs:
         run: |
           cd llama.cpp
           $hipPath = $env:HIP_PATH
-          $env:PATH = "$hipPath\bin;$env:PATH"
+          $hipBin = $env:HIP_BIN
+          $env:PATH = "$hipBin;$env:PATH"
+
           cmake -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DGGML_HIP=ON `
             -DAMDGPU_TARGETS=gfx1030 `
-            -DCMAKE_C_COMPILER="$hipPath\bin\clang.exe" `
-            -DCMAKE_CXX_COMPILER="$hipPath\bin\clang++.exe" `
+            -DCMAKE_C_COMPILER="$hipBin\clang.exe" `
+            -DCMAKE_CXX_COMPILER="$hipBin\clang++.exe" `
             -DGGML_CUDA_BATCH_INVARIANT=ON `
             -DLLAMA_BUILD_SERVER=ON `
             -DLLAMA_BUILD_EXAMPLES=OFF `
@@ -189,7 +205,7 @@ jobs:
         timeout-minutes: 90
         run: |
           cd llama.cpp
-          $env:PATH = "$($env:HIP_PATH)\bin;$env:PATH"
+          $env:PATH = "$($env:HIP_BIN);$env:PATH"
           cmake --build build --target llama-server llama-cli -j $env:NUMBER_OF_PROCESSORS
           Write-Host "Build completed. Artifacts:"
           Get-ChildItem build\bin\ | Format-Table Name, Length
@@ -202,23 +218,42 @@ jobs:
         run: |
           $hash = "${{ steps.get_commit.outputs.COMMIT_HASH }}"
           $date = Get-Date -Format 'yyyyMMdd'
-          $hipBin = "$env:HIP_PATH\bin"
+          $hipPath = $env:HIP_PATH
           mkdir output
+
           copy llama.cpp\build\bin\llama-server.exe output\
           copy llama.cpp\build\bin\llama-cli.exe output\
-          $dlls = @("amdhip64.dll", "rocblas.dll", "hipblas.dll", "rocsolver.dll", "rocsparse.dll", "hipfft.dll", "rccl.dll", "hiprand.dll", "rocrand.dll", "hipcub.dll", "roctracer64.dll")
-          foreach ($dll in $dlls) {
-            $src = Join-Path $hipBin $dll
-            if (Test-Path $src) { copy $src output\ }
+
+          # 递归搜索并复制关键 ROCm DLL
+          $dllNames = @(
+            "amdhip64*.dll", "rocblas*.dll", "hipblas*.dll", "rocsolver*.dll",
+            "rocsparse*.dll", "hipfft*.dll", "rccl*.dll", "hiprand*.dll",
+            "rocrand*.dll", "hipcub*.dll", "roctracer64*.dll"
+          )
+          foreach ($pattern in $dllNames) {
+            $found = Get-ChildItem -Path $hipPath -Recurse -Filter $pattern -ErrorAction SilentlyContinue |
+                     Select-Object -First 1
+            if ($found) {
+              copy $found.FullName output\
+              Write-Host "Copied $($found.Name)"
+            } else {
+              Write-Host "Skipped missing pattern $pattern"
+            }
           }
+
           @"
           Branch: bonsai2 (sudoingX/llama.cpp)
           Commit: $hash
           Build Date: $date
           Target GPU: gfx1030 (RX 6800 XT)
+          HIP SDK Path: $hipPath
           Features: PQ2_0 support + MTP Hadamard fix + PTQ1_0 MMV kernel
           "@ | Out-File output\BUILD_INFO.txt -Encoding UTF8
+
           Compress-Archive -Path output\* -DestinationPath "bonsai2-win-gfx1030-$hash-$date.zip"
+
+          Write-Host "Packaging completed."
+          Get-ChildItem *.zip | Format-Table Name, Length
 
       # ============================================================
       # 12. Upload artifacts
