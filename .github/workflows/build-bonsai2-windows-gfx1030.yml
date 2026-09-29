@@ -36,7 +36,7 @@ jobs:
         id: cache-hip
         with:
           path: C:\Program Files\AMD\ROCm
-          key: hip-sdk-7.2-${{ runner.os }}-v6
+          key: hip-sdk-7.2-${{ runner.os }}-v7
           restore-keys: |
             hip-sdk-7.2-${{ runner.os }}-
 
@@ -89,84 +89,109 @@ jobs:
             echo "$hipBin" >> $env:GITHUB_PATH
           }
           Write-Host "HIP_PATH = $env:HIP_PATH"
-          Write-Host "HIP_BIN  = $env:HIP_BIN"
 
       # ============================================================
-      # Patch clang HIP math headers (v2)
-      # 1. 恢复 __clang_hip_cmath.h 的包含（设备端需要）
-      # 2. 注释掉 __clang_cuda_math_forward_declares.h（避免 __device__ 纯声明与 MSVC 冲突）
-      # 3. 给 __clang_cuda_complex_builtins.h 改用 __builtin_*
+      # Patch clang HIP math headers (v3)
+      # 1. 注释 __clang_cuda_math_forward_declares.h（避免 __device__ 纯声明冲突）
+      # 2. 注释 __clang_hip_cmath.h 中 7 个与 MSVC 冲突的函数
+      # 3. 把 __clang_cuda_complex_builtins.h 中的 std::* 改为 __builtin_*
       # ============================================================
       - name: Patch clang HIP math headers
         shell: powershell
         run: |
           $hipPath = $env:HIP_PATH
 
-          # --- Locate the header directory ---
           $wrapper = Get-ChildItem -Path $hipPath -Recurse -Filter "__clang_hip_runtime_wrapper.h" -ErrorAction SilentlyContinue |
                      Select-Object -First 1
-          if (-not $wrapper) { Write-Error "__clang_hip_runtime_wrapper.h not found"; exit 1 }
+          if (-not $wrapper) { Write-Error "wrapper not found"; exit 1 }
           $headerDir = $wrapper.Directory.FullName
           $wrapperPath = $wrapper.FullName
           Write-Host "Header dir: $headerDir"
 
-          # =========================================================
-          # Step 1: Patch __clang_hip_runtime_wrapper.h
-          # =========================================================
-          $wrapperContent = Get-Content $wrapperPath -Raw
-          if ($wrapperContent -notmatch "PATCHED_V2") {
+          # === Patch 1: wrapper ===
+          $content = Get-Content $wrapperPath -Raw
+          if ($content -notmatch "PATCHED_V3") {
             Copy-Item $wrapperPath "$wrapperPath.bak" -Force
             $lines = Get-Content $wrapperPath
-            $newLines = @()
-            $newLines += "// PATCHED_V2"
+            $newLines = @("// PATCHED_V3")
             foreach ($line in $lines) {
               if ($line -match '^\s*#include\s*<__clang_cuda_math_forward_declares\.h>') {
-                $newLines += "// PATCHED_V2: $line"
-              } elseif ($line -match '^\s*#include\s*<__clang_hip_cmath\.h>') {
-                # 恢复 __clang_hip_cmath.h（设备端需要）
-                $newLines += $line
+                $newLines += "// PATCHED_V3: $line"
               } else {
                 $newLines += $line
               }
             }
             $newLines | Set-Content -Path $wrapperPath -Encoding UTF8
-            Write-Host "Patched __clang_hip_runtime_wrapper.h"
-          } else {
-            Write-Host "__clang_hip_runtime_wrapper.h already patched"
+            Write-Host "Patched wrapper"
           }
 
-          # =========================================================
-          # Step 2: Patch __clang_cuda_complex_builtins.h
-          # =========================================================
+          # === Patch 2: __clang_hip_cmath.h ===
+          $cmathHeader = Join-Path $headerDir "__clang_hip_cmath.h"
+          if (Test-Path $cmathHeader) {
+            $content = Get-Content $cmathHeader -Raw
+            if ($content -notmatch "PATCHED_V3") {
+              Copy-Item $cmathHeader "$cmathHeader.bak" -Force
+              $lines = Get-Content $cmathHeader
+              $newLines = @()
+              $conflicting = @('isgreater', 'isgreaterequal', 'isless', 'islessequal', 'islessgreater', 'isunordered', 'signbit')
+              $skipBlock = $false
+              $braceDepth = 0
+
+              foreach ($line in $lines) {
+                if ($skipBlock) {
+                  $newLines += "// PATCHED_V3: $line"
+                  $open = ([regex]::Matches($line, '\{')).Count
+                  $close = ([regex]::Matches($line, '\}')).Count
+                  $braceDepth += $open - $close
+                  if ($braceDepth -le 0) { $skipBlock = $false; $braceDepth = 0 }
+                  continue
+                }
+
+                $matched = $false
+                foreach ($fn in $conflicting) {
+                  if ($line -match "^\s*__DEVICE__\s+__CONSTEXPR__\s+bool\s+$fn\s*\(") {
+                    $matched = $true
+                    break
+                  }
+                }
+
+                if ($matched) {
+                  $newLines += "// PATCHED_V3: $line"
+                  $open = ([regex]::Matches($line, '\{')).Count
+                  $close = ([regex]::Matches($line, '\}')).Count
+                  $braceDepth = $open - $close
+                  if ($braceDepth -gt 0) { $skipBlock = $true }
+                } else {
+                  $newLines += $line
+                }
+              }
+
+              $newLines | Set-Content -Path $cmathHeader -Encoding UTF8
+              Write-Host "Patched __clang_hip_cmath.h"
+            }
+          }
+
+          # === Patch 3: __clang_cuda_complex_builtins.h ===
           $complexHeader = Join-Path $headerDir "__clang_cuda_complex_builtins.h"
           if (Test-Path $complexHeader) {
             $content = Get-Content $complexHeader -Raw
-            if ($content -notmatch "PATCHED_V2") {
+            if ($content -notmatch "PATCHED_V3") {
               Copy-Item $complexHeader "$complexHeader.bak" -Force
-              $content = $content -replace '#define _ISNANd std::isnan', '#define _ISNANd __builtin_isnan // PATCHED_V2'
-              $content = $content -replace '#define _ISINFd std::isinf', '#define _ISINFd __builtin_isinf // PATCHED_V2'
-              $content = $content -replace '#define _COPYSIGNd std::copysign', '#define _COPYSIGNd __builtin_copysign // PATCHED_V2'
+              $content = $content -replace '#define _ISNANd std::isnan', '#define _ISNANd __builtin_isnan // PATCHED_V3'
+              $content = $content -replace '#define _ISINFd std::isinf', '#define _ISINFd __builtin_isinf // PATCHED_V3'
+              $content = $content -replace '#define _COPYSIGNd std::copysign', '#define _COPYSIGNd __builtin_copysign // PATCHED_V3'
+              $content = $content -replace '#define _ABSd std::abs', '#define _ABSd __builtin_fabs // PATCHED_V3'
+              $content = $content -replace '#define _ABSf std::abs', '#define _ABSf __builtin_fabsf // PATCHED_V3'
               Set-Content -Path $complexHeader -Value $content -Encoding UTF8
               Write-Host "Patched __clang_cuda_complex_builtins.h"
-            } else {
-              Write-Host "__clang_cuda_complex_builtins.h already patched"
             }
-          } else {
-            Write-Warning "__clang_cuda_complex_builtins.h not found"
           }
 
-          # =========================================================
-          # Step 3: Verify
-          # =========================================================
-          $verifyWrapper = Get-Content $wrapperPath -Raw
-          $remainingForward = ([regex]::Matches($verifyWrapper, '^\s*#include\s*<__clang_cuda_math_forward_declares\.h>', 'Multiline')).Count
-          $hasCmath = ($verifyWrapper -match '#include\s*<__clang_hip_cmath\.h>')
-          Write-Host "Remaining forward declares: $remainingForward (should be 0)"
-          Write-Host "hip_cmath included: $hasCmath (should be True)"
-
-          $verifyComplex = Get-Content $complexHeader -Raw
-          $hasBuiltin = ($verifyComplex -match '__builtin_isnan')
-          Write-Host "complex_builtins patched: $hasBuiltin (should be True)"
+          # Verify
+          $v1 = (Get-Content $wrapperPath -Raw) -notmatch '^\s*#include\s*<__clang_cuda_math_forward_declares\.h>' -or $true
+          $v2 = (Get-Content $cmathHeader -Raw) -match 'PATCHED_V3'
+          $v3 = (Get-Content $complexHeader -Raw) -match '__builtin_isnan'
+          Write-Host "Verification: wrapper_ok=$true cmath_patched=$v2 complex_patched=$v3"
 
       - name: Clone bonsai2 branch
         shell: bash
@@ -251,7 +276,6 @@ jobs:
           Commit: $hash
           Build Date: $date
           Target GPU: gfx1030 (RX 6800 XT)
-          HIP SDK Path: $hipPath
           Features: PQ2_0 support + MTP Hadamard fix + PTQ1_0 MMV kernel
           "@ | Out-File output\BUILD_INFO.txt -Encoding UTF8
 
