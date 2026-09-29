@@ -80,10 +80,10 @@ jobs:
             $nested = Get-ChildItem -Path $root -Recurse -Include *.cab,*.msi,*.7z,*.zip -ErrorAction SilentlyContinue |
                       Where-Object { $_.FullName -notmatch "extracted_" }
             if (-not $nested) {
-              Write-Host "Stage $depth: no more nested archives found."
+              Write-Host "Stage ${depth}: no more nested archives found."
               break
             }
-            Write-Host "Stage $depth: extracting $($nested.Count) nested archive(s)"
+            Write-Host "Stage ${depth}: extracting $($nested.Count) nested archive(s)"
             foreach ($n in $nested) {
               $out = Join-Path $n.DirectoryName ("extracted_" + $n.BaseName)
               & $sevenZip x $n.FullName -o"$out" -y 2>&1 | Out-Null
@@ -316,5 +316,11 @@ jobs:
             - **Target GPU**: gfx1030 (RX 6800 XT)
             - **Features**: PQ2_0 support + MTP Hadamard fix + PTQ1_0 MMV kernel
             - **Build**: ${{ github.run_id }}
-          files: bonsai2-win-gfx1030-*.zip
-          generate_release_notes: false
+
+            ### Run example
+            ```powershell
+            .\llama-server.exe -m "D:\ai-soft\AI-model\Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0.gguf" `
+              --mmproj "D:\ai-soft\AI-model\Ternary-Bonsai-27B-mmproj-Q8_0.gguf" `
+              -ngl 99 -c 65536 -fa on -ctk q8_0 -ctv q8_0 `
+              --load-mode none -np 1 --jinja `
+              --spec-type draft-mtp --spec-draft-n-max 1 --port 8080
