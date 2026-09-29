@@ -219,9 +219,6 @@ jobs:
           cmake --build build --target llama-server llama-cli -j $env:NUMBER_OF_PROCESSORS
           Get-ChildItem build\bin\ | Format-Table Name, Length
 
-      # ============================================================
-      # 关键修复：把 zip 输出到稳定的 release/ 目录，便于后续引用
-      # ============================================================
       - name: Collect artifacts
         shell: powershell
         run: |
@@ -231,11 +228,9 @@ jobs:
           mkdir output
           mkdir release
 
-          # llama.cpp 自身的运行时（exe + dll）
           Copy-Item llama.cpp\build\bin\*.exe output\ -ErrorAction SilentlyContinue
           Copy-Item llama.cpp\build\bin\*.dll output\ -ErrorAction SilentlyContinue
 
-          # ROCm 运行时 DLL
           $hipBinDirs = @(
             (Join-Path $hipPath "bin"),
             (Join-Path $env:HIP_BIN "")
@@ -267,7 +262,6 @@ jobs:
           Features: PQ2_0 support + MTP Hadamard fix + PTQ1_0 MMV kernel
           "@ | Out-File output\BUILD_INFO.txt -Encoding UTF8
 
-          # 打包并同时放到 release/ 目录
           $zipName = "bonsai2-win-gfx1030-$hash-$date.zip"
           Compress-Archive -Path output\* -DestinationPath $zipName -Force
           Copy-Item $zipName "release\$zipName" -Force
@@ -282,62 +276,37 @@ jobs:
           path: release/*.zip
           retention-days: 30
 
-      - name: Check if release exists
-        id: check_release
-        shell: powershell
+      # ============================================================
+      # 用 gh CLI 创建 Release（单行 if 条件，无独立检查步骤）
+      # ============================================================
+      - name: Create Release with gh CLI
+        if: github.event_name != 'workflow_dispatch' || github.event.inputs.create_release == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $tag = "bonsai2-win-gfx1030-${{ steps.get_commit.outputs.COMMIT_HASH }}"
-          $headers = @{
-            "Authorization" = "token ${{ secrets.GITHUB_TOKEN }}"
-            "Accept" = "application/vnd.github+json"
-            "User-Agent" = "GitHub-Action"
-          }
-          try {
-            $resp = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/releases/tags/$tag" -Headers $headers -ErrorAction Stop
-            Write-Host "Release already exists: $tag"
-            echo "EXISTS=true" >> $env:GITHUB_OUTPUT
-          } catch {
-            Write-Host "Release not found, will create: $tag"
-            echo "EXISTS=false" >> $env:GITHUB_OUTPUT
-          }
+          set -e
+          TAG="bonsai2-win-gfx1030-${{ steps.get_commit.outputs.COMMIT_HASH }}"
+          echo "=== event_name: ${{ github.event_name }} ==="
+          echo "=== Target tag: $TAG ==="
 
-      - name: Create Release
-        if: |
-          steps.check_release.outputs.EXISTS == 'false' && (
-            (github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true') ||
-            (github.event_name != 'workflow_dispatch')
-          )
-        uses: softprops/action-gh-release@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          tag_name: bonsai2-win-gfx1030-${{ steps.get_commit.outputs.COMMIT_HASH }}
-          name: "Bonsai2 MTP Windows gfx1030 - ${{ steps.get_commit.outputs.COMMIT_HASH }}"
-          draft: false
-          prerelease: false
-          make_latest: true
-          generate_release_notes: false
-          # 关键修复：使用绝对路径 + ${{ github.workspace }} 前缀
-          files: ${{ github.workspace }}/release/bonsai2-win-gfx1030-*.zip
-          body: |
-            ## Bonsai2 MTP Windows Build for RX 6800 XT
+          # 用 gh CLI 检查是否已存在
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, skipping."
+            exit 0
+          fi
 
-            基于 [`sudoingX/llama.cpp`](https://github.com/sudoingX/llama.cpp) 的 `bonsai2` 分支构建。
+          echo "=== Files to upload ==="
+          ls -la release/
 
-            ### 构建信息
-            - **Commit**: `${{ steps.get_commit.outputs.COMMIT_HASH }}`
-            - **目标 GPU**: gfx1030 (RX 6800 XT)
-            - **构建时间**: ${{ github.run_id }}
-            - **工作流**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          gh release create "$TAG" \
+            --title "Bonsai2 MTP Windows gfx1030 - ${{ steps.get_commit.outputs.COMMIT_HASH }}" \
+            --notes "Built from [sudoingX/llama.cpp](https://github.com/sudoingX/llama.cpp) bonsai2 branch.
 
-            ### 特性
-            - PQ2_0 三元量化解析
-            - MTP Hadamard 修复（启用 `--spec-type draft-mtp`）
-            - PTQ1_0 MMV 内核优化
+          Commit: \`${{ steps.get_commit.outputs.COMMIT_HASH }}\`
+          Target GPU: gfx1030 (RX 6800 XT)
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            release/*.zip
 
-            ### 快速开始
-            ```powershell
-            .\llama-server.exe -m "D:\path\to\Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0.gguf" `
-              --mmproj "D:\path\to\Ternary-Bonsai-27B-mmproj-Q8_0.gguf" `
-              -ngl 99 -c 65536 -fa on -ctk q8_0 -ctv q8_0 `
-              --load-mode none -np 1 --jinja `
-              --spec-type draft-mtp --spec-draft-n-max 1 --port 8080
+          echo "=== Release created successfully ==="
+          gh release view "$TAG"
